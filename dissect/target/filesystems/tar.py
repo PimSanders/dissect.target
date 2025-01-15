@@ -60,7 +60,10 @@ class TarFilesystem(Filesystem):
     @staticmethod
     def _detect(fh: BinaryIO) -> bool:
         """Detect a tar file on a given file-like object."""
-        return tarfile.is_tarfile(fh)
+        fh = fsutil.open_decompress(fileobj=fh)
+
+        fh.seek(257)
+        return fh.read(8) in (tarfile.GNU_MAGIC, tarfile.POSIX_MAGIC)
 
     def get(self, path: str, relentry: Optional[FilesystemEntry] = None) -> FilesystemEntry:
         """Returns a TarFilesystemEntry object corresponding to the given path."""
@@ -118,7 +121,7 @@ class TarFilesystemEntry(VirtualFile):
     def readlink_ext(self) -> FilesystemEntry:
         """Read the link if this entry is a symlink. Returns a filesystem entry."""
         # Can't use the one in VirtualFile as it overrides the FilesystemEntry
-        return fsutil.resolve_link(fs=self.fs, entry=self)
+        return fsutil.resolve_link(self.fs, self.readlink(), self.path, alt_separator=self.fs.alt_separator)
 
     def stat(self, follow_symlinks: bool = True) -> fsutil.stat_result:
         """Return the stat information of this entry."""

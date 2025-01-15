@@ -1,6 +1,10 @@
+from functools import cache
+
+from dissect.target.helpers import keychain
 from dissect.target.helpers.descriptor_extensions import UserRecordDescriptorExtension
 from dissect.target.helpers.record import create_extended_descriptor
 from dissect.target.plugin import NamespacePlugin
+from dissect.target.target import Target
 
 GENERIC_DOWNLOAD_RECORD_FIELDS = [
     ("datetime", "ts_start"),
@@ -31,6 +35,21 @@ GENERIC_EXTENSION_RECORD_FIELDS = [
     ("path", "source"),
 ]
 
+GENERIC_COOKIE_FIELDS = [
+    ("datetime", "ts_created"),
+    ("datetime", "ts_last_accessed"),
+    ("string", "browser"),
+    ("string", "name"),
+    ("string", "value"),
+    ("string", "host"),
+    ("string", "path"),
+    ("varint", "expiry"),
+    ("boolean", "is_secure"),
+    ("boolean", "is_http_only"),
+    ("boolean", "same_site"),
+    ("path", "source"),
+]
+
 GENERIC_HISTORY_RECORD_FIELDS = [
     ("datetime", "ts"),
     ("string", "browser"),
@@ -48,6 +67,21 @@ GENERIC_HISTORY_RECORD_FIELDS = [
     ("uri", "from_url"),
     ("path", "source"),
 ]
+
+GENERIC_PASSWORD_RECORD_FIELDS = [
+    ("datetime", "ts_created"),
+    ("datetime", "ts_last_used"),
+    ("datetime", "ts_last_changed"),
+    ("string", "browser"),
+    ("varint", "id"),
+    ("uri", "url"),
+    ("string", "encrypted_username"),
+    ("string", "encrypted_password"),
+    ("string", "decrypted_username"),
+    ("string", "decrypted_password"),
+    ("path", "source"),
+]
+
 BrowserDownloadRecord = create_extended_descriptor([UserRecordDescriptorExtension])(
     "browser/download", GENERIC_DOWNLOAD_RECORD_FIELDS
 )
@@ -57,10 +91,37 @@ BrowserExtensionRecord = create_extended_descriptor([UserRecordDescriptorExtensi
 BrowserHistoryRecord = create_extended_descriptor([UserRecordDescriptorExtension])(
     "browser/history", GENERIC_HISTORY_RECORD_FIELDS
 )
+BrowserCookieRecord = create_extended_descriptor([UserRecordDescriptorExtension])(
+    "browser/cookie", GENERIC_COOKIE_FIELDS
+)
+BrowserPasswordRecord = create_extended_descriptor([UserRecordDescriptorExtension])(
+    "browser/password", GENERIC_PASSWORD_RECORD_FIELDS
+)
 
 
 class BrowserPlugin(NamespacePlugin):
     __namespace__ = "browser"
+
+    def __init__(self, target: Target):
+        super().__init__(target)
+        self.keychain = cache(self.keychain)
+
+    def keychain(self) -> set:
+        """Retrieve a set of passphrases to use for decrypting saved browser credentials.
+
+        Always adds an empty passphrase as some browsers encrypt values using empty passphrases.
+
+        Returns:
+            Set of passphrase strings.
+        """
+        passphrases = set()
+        for provider in [self.__namespace__, "browser", "user", None]:
+            for key in keychain.get_keys_for_provider(provider) if provider else keychain.get_keys_without_provider():
+                if key.key_type == keychain.KeyType.PASSPHRASE:
+                    passphrases.add(key.value)
+
+        passphrases.add("")
+        return passphrases
 
 
 def try_idna(url: str) -> bytes:

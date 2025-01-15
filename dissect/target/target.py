@@ -14,10 +14,12 @@ from dissect.target.exceptions import (
     PluginError,
     PluginNotFoundError,
     TargetError,
+    TargetPathNotFoundError,
     UnsupportedPluginError,
     VolumeSystemError,
 )
 from dissect.target.helpers import config
+from dissect.target.helpers.fsutil import TargetPath
 from dissect.target.helpers.loaderutil import extract_path_info
 from dissect.target.helpers.record import ChildTargetRecord
 from dissect.target.helpers.utils import StrEnum, parse_path_uri, slugify
@@ -79,16 +81,22 @@ class Target:
         self._functions: dict[str, FunctionTuple] = {}
         self._loader = None
         self._os = None
-        self._os_plugin: plugin.OSPlugin = None
+        self._os_plugin: type[plugin.OSPlugin] = None
         self._child_plugins: dict[str, plugin.ChildTargetPlugin] = {}
         self._cache = dict()
         self._errors = []
         self._applied = False
 
+        # We do not want to look for config files at the Target path if it is actually a child Target.
+        config_paths = [Path.cwd(), Path.home()]
+        if not isinstance(path, TargetPath):
+            config_paths = [self.path] + config_paths
+
         try:
-            self._config = config.load(self.path)
-        except Exception:
-            self.log.exception("Error loading config file")
+            self._config = config.load(config_paths)
+        except Exception as e:
+            self.log.warning("Error loading config file: %s", self.path)
+            self.log.debug("", exc_info=e)
             self._config = config.load(None)  # This loads an empty config.
 
         # Fill the disks and/or volumes and/or filesystems and apply() will
@@ -225,7 +233,10 @@ class Target:
 
         loader_cls = loader.find_loader(path, parsed_path=parsed_path)
         if loader_cls:
-            loader_instance = loader_cls(path, parsed_path=parsed_path)
+            try:
+                loader_instance = loader_cls(path, parsed_path=parsed_path)
+            except Exception as e:
+                raise TargetError(f"Failed to initiate {loader_cls.__name__} for target {path}: {e}") from e
             return cls._load(path, loader_instance)
         return cls.open_raw(path)
 
@@ -277,11 +288,16 @@ class Target:
                     continue
 
                 getlogger(entry).debug("Attempting to use loader: %s", loader_cls)
-                for sub_entry in loader_cls.find_all(entry):
+                for sub_entry in loader_cls.find_all(entry, parsed_path=parsed_path):
                     try:
                         ldr = loader_cls(sub_entry, parsed_path=parsed_path)
                     except Exception as e:
-                        getlogger(sub_entry).error("Failed to initiate loader", exc_info=e)
+                        message = "Failed to initiate loader: %s"
+                        if isinstance(e, TargetPathNotFoundError):
+                            message = "%s"
+
+                        getlogger(sub_entry).error(message, e)
+                        getlogger(sub_entry).debug("", exc_info=e)
                         continue
 
                     try:
@@ -335,7 +351,7 @@ class Target:
                 child_plugin.check_compatible()
                 self._child_plugins[child_plugin.__type__] = child_plugin
             except PluginError as e:
-                self.log.info("Child plugin reported itself as incompatible: %s (%s)", plugin_desc["class"], e)
+                self.log.debug("Child plugin reported itself as incompatible: %s (%s)", plugin_desc["class"], e)
             except Exception:
                 self.log.exception(
                     "An exception occurred while checking for child plugin compatibility: %s", plugin_desc["class"]
@@ -368,7 +384,7 @@ class Target:
             recursive: Whether to check the child ``Target`` for more ``Targets``.
 
         Returns:
-            An interator of ``Targets``.
+            An iterator of ``Targets``.
         """
         for child in self.list_children():
             try:
@@ -412,7 +428,7 @@ class Target:
             target.apply()
             return target
         except Exception as e:
-            raise TargetError(f"Failed to load target: {path}", cause=e)
+            raise TargetError(f"Failed to load target: {path}") from e
 
     def _init_os(self) -> None:
         """Internal function that attemps to load an OSPlugin for this target."""
@@ -525,7 +541,7 @@ class Target:
             except PluginError:
                 raise
             except Exception as e:
-                raise PluginError(f"An exception occurred while trying to initialize a plugin: {plugin_cls}", cause=e)
+                raise PluginError(f"An exception occurred while trying to initialize a plugin: {plugin_cls}") from e
         else:
             p = plugin_cls
 
@@ -540,8 +556,8 @@ class Target:
                 raise
             except Exception as e:
                 raise UnsupportedPluginError(
-                    f"An exception occurred while checking for plugin compatibility: {plugin_cls}", cause=e
-                )
+                    f"An exception occurred while checking for plugin compatibility: {plugin_cls}"
+                ) from e
 
         self._register_plugin_functions(p)
 
@@ -598,9 +614,8 @@ class Target:
                     # Just take the last known cause for now
                     raise UnsupportedPluginError(
                         f"Unsupported function `{function}` for target with OS plugin {self._os_plugin}",
-                        cause=causes[0] if causes else None,
                         extra=causes[1:] if len(causes) > 1 else None,
-                    )
+                    ) from causes[0] if causes else None
 
         # We still ended up with no compatible plugins
         if function not in self._functions:
@@ -758,22 +773,22 @@ class VolumeCollection(Collection[volume.Volume]):
                     # If we opened an empty volume system, it might also be the case that a filesystem actually
                     # "starts" at offset 0
 
+                    # Regardless of what happens, we want to try to open it as a filesystem later on
+                    fs_volumes.append(vol)
+
                     if vol.offset == 0 and vol.vs and vol.vs.__type__ == "disk":
                         # We are going to re-open a volume system on itself, bail out
                         self.target.log.info("Found volume with offset 0, opening as raw volume instead")
-                        fs_volumes.append(vol)
                         continue
 
                     try:
                         vs = volume.open(vol)
                     except Exception:
                         # If opening a volume system fails, there's likely none, so open as a filesystem instead
-                        fs_volumes.append(vol)
                         continue
 
                     if not len(vs.volumes):
                         # We opened an empty volume system, discard
-                        fs_volumes.append(vol)
                         continue
 
                     self.entries.extend(vs.volumes)

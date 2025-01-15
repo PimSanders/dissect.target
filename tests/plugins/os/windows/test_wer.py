@@ -8,7 +8,18 @@ def test_wer_plugin(target_win, fs_win):
     wer_dir = absolute_path("_data/plugins/os/windows/wer")
     fs_win.map_dir("ProgramData/Microsoft/Windows/WER/ReportQueue/test", wer_dir)
     target_win.add_plugin(WindowsErrorReportingPlugin)
-    tests = ["os_version_information_lcid", "response_type", "sig", "dynamic_sig", "dynamic_signatures_parameter1"]
+    tests = [
+        "os_version_information_lcid",
+        "response_type",
+        "sig",
+        "dynamic_sig",
+        "dynamic_signatures_parameter1",
+        "ui_x5b_1_x5d",
+        "sp_xc3a9_cial_charact_xc3a9_r",
+        "xd0bd_xd0b5_xd0b2_xd0b8_xd0b4_xd0b8_xd0bc_xd18b_xd0b9",
+        "x5f_start_with_an_",
+        "x33__start_with_a_3",
+    ]
 
     records = list(target_win.wer())
     assert len(records) == 2

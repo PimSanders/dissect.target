@@ -1,4 +1,5 @@
 from datetime import datetime
+from pathlib import Path
 from statistics import median
 from typing import Optional
 
@@ -8,6 +9,8 @@ from dissect.target.plugin import Plugin, export
 
 
 class GenericPlugin(Plugin):
+    """Generic plugin for Unix targets."""
+
     def check_compatible(self) -> None:
         pass
 
@@ -15,16 +18,7 @@ class GenericPlugin(Plugin):
     def activity(self) -> Optional[datetime]:
         """Return last seen activity based on filesystem timestamps."""
         var_log = self.target.fs.path("/var/log")
-        if not var_log.exists():
-            return
-
-        last_seen = 0
-        for f in var_log.iterdir():
-            if f.stat().st_mtime > last_seen:
-                last_seen = f.stat().st_mtime
-
-        if last_seen != 0:
-            return ts.from_unix(last_seen)
+        return calculate_last_activity(var_log)
 
     @export(property=True)
     def install_date(self) -> Optional[datetime]:
@@ -61,3 +55,18 @@ class GenericPlugin(Plugin):
         root_stat = self.target.fs.stat("/")
         if root_stat.st_ctime == root_stat.st_mtime:
             return ts.from_unix(root_stat.st_ctime)
+
+
+def calculate_last_activity(folder: Path) -> Optional[datetime]:
+    if not folder.exists():
+        return
+
+    last_seen = 0
+    for file in folder.iterdir():
+        if not file.exists():
+            continue
+        if file.stat().st_mtime > last_seen:
+            last_seen = file.stat().st_mtime
+
+    if last_seen != 0:
+        return ts.from_unix(last_seen)

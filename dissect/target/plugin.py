@@ -1,10 +1,12 @@
 """Dissect plugin system.
 
-See dissect/target/plugins/general/example.py for an example plugin.
+See ``dissect/target/plugins/general/example.py`` for an example plugin.
 """
+
 from __future__ import annotations
 
 import fnmatch
+import functools
 import importlib
 import importlib.util
 import inspect
@@ -55,17 +57,18 @@ log = logging.getLogger(__name__)
 
 
 class OperatingSystem(StrEnum):
-    LINUX = "linux"
-    WINDOWS = "windows"
-    ESXI = "esxi"
-    BSD = "bsd"
-    OSX = "osx"
-    UNIX = "unix"
     ANDROID = "android"
-    VYOS = "vyos"
-    IOS = "ios"
-    FORTIGATE = "fortigate"
+    BSD = "bsd"
     CITRIX = "citrix-netscaler"
+    ESXI = "esxi"
+    FORTIOS = "fortios"
+    IOS = "ios"
+    LINUX = "linux"
+    OSX = "osx"
+    PROXMOX = "proxmox"
+    UNIX = "unix"
+    VYOS = "vyos"
+    WINDOWS = "windows"
 
 
 def export(*args, **kwargs) -> Callable:
@@ -74,18 +77,19 @@ def export(*args, **kwargs) -> Callable:
     Supported keyword arguments:
         property (bool): Whether this export should be regarded as a property.
             Properties are implicitly cached.
+
         cache (bool): Whether the result of this function should be cached.
+
         record (RecordDescriptor): The :class:`flow.record.RecordDescriptor` for the records that this function yields.
             If the records are dynamically made, use DynamicRecord instead.
-        output (str): The output type of this function. Can be one of:
 
+        output (str): The output type of this function. Must be one of:
         - default: Single return value
         - record: Yields records. Implicit when record argument is given.
         - yield: Yields printable values.
-        - none: No return value.
+        - none: No return value. Plugin is responsible for output formatting and should return ``None``.
 
     The ``export`` decorator adds some additional private attributes to an exported method or property:
-
     - ``__output__``: The output type to expect for this function, this is the same as ``output``.
     - ``__record__``: The type of record to expect, this value is the same as ``record``.
     - ``__exported__``: set to ``True`` to indicate the method or property is exported.
@@ -140,7 +144,7 @@ def get_nonprivate_attributes(cls: Type[Plugin]) -> list[Any]:
 
 def get_nonprivate_methods(cls: Type[Plugin]) -> list[Callable]:
     """Retrieve all public methods of a :class:`Plugin`."""
-    return [attr for attr in get_nonprivate_attributes(cls) if not isinstance(attr, property)]
+    return [attr for attr in get_nonprivate_attributes(cls) if not isinstance(attr, property) and callable(attr)]
 
 
 def get_descriptors_on_nonprivate_methods(cls: Type[Plugin]) -> list[RecordDescriptor]:
@@ -171,7 +175,7 @@ class Plugin:
     class attribute. Namespacing results in your plugin needing to be prefixed
     with this namespace when being called. For example, if your plugin has
     specified ``test`` as namespace and a function called ``example``, you must
-    call your plugin with ``test.example``::
+    call your plugin with ``test.example``.
 
     A ``Plugin`` class has the following private class attributes:
 
@@ -196,6 +200,8 @@ class Plugin:
     The :func:`internal` decorator and :class:`InternalPlugin` set the ``__internal__`` attribute.
     Finally. :func:`args` decorator sets the ``__args__`` attribute.
 
+    The :func:`alias` decorator populates the ``__aliases__`` private attribute of :class:`Plugin` methods.
+
     Args:
         target: The :class:`~dissect.target.target.Target` object to load the plugin for.
     """
@@ -215,8 +221,6 @@ class Plugin:
     produce redundant results when used with a wild card
     (browser.* -> browser.history + browser.*.history).
     """
-    __skip__: bool = False
-    """Prevents plugin functions from indexing this plugin at all."""
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -294,17 +298,42 @@ class OSPlugin(Plugin):
     This provides a base class for certain common functions of OS's, which each OS plugin has to implement separately.
 
     For example, it provides an interface for retrieving the hostname and users of a target.
+
+    All derived classes MUST implement ALL the classmethods and exported
+    methods with the same ``@classmethod`` or ``@export(...)`` annotation.
     """
 
+    def __init_subclass__(cls, **kwargs):
+        # Note that cls is the subclass
+        super().__init_subclass__(**kwargs)
+
+        for os_method in get_nonprivate_attributes(OSPlugin):
+            if isinstance(os_method, property):
+                os_method = os_method.fget
+            os_docstring = os_method.__doc__
+
+            method = getattr(cls, os_method.__name__, None)
+            if isinstance(method, property):
+                method = method.fget
+            # This works as None has a __doc__ property (which is None).
+            docstring = method.__doc__
+
+            if method and not docstring:
+                if hasattr(method, "__func__"):
+                    method = method.__func__
+                method.__doc__ = os_docstring
+
     def check_compatible(self) -> bool:
-        """OSPlugin's use a different compatibility check, override the default one."""
+        """OSPlugin's use a different compatibility check, override the one from the :class:`Plugin` class.
+
+        Returns:
+            This function always returns ``True``.
+        """
         return True
 
     @classmethod
     def detect(cls, fs: Filesystem) -> Optional[Filesystem]:
         """Provide detection of this OSPlugin on a given filesystem.
-
-        Note: must be implemented as a classmethod.
 
         Args:
             fs: :class:`~dissect.target.filesystem.Filesystem` to detect the OS on.
@@ -318,11 +347,9 @@ class OSPlugin(Plugin):
     def create(cls, target: Target, sysvol: Filesystem) -> OSPlugin:
         """Initiate this OSPlugin with the given target and detected filesystem.
 
-        Note: must be implemented as a classmethod.
-
         Args:
-            target: The Target object.
-            sysvol: The filesystem that was detected in the detect() function.
+            target: The :class:`~dissect.target.target.Target` object.
+            sysvol: The filesystem that was detected in the ``detect()`` function.
 
         Returns:
             An instantiated version of the OSPlugin.
@@ -331,9 +358,7 @@ class OSPlugin(Plugin):
 
     @export(property=True)
     def hostname(self) -> Optional[str]:
-        """Required OS function.
-
-        Implementations must be decorated with ``@export(property=True)``.
+        """Return the target's hostname.
 
         Returns:
             The hostname as string.
@@ -342,9 +367,7 @@ class OSPlugin(Plugin):
 
     @export(property=True)
     def ips(self) -> list[str]:
-        """Required OS function.
-
-        Implementations must be decorated with ``@export(property=True)``.
+        """Return the IP addresses configured in the target.
 
         Returns:
             The IPs as list.
@@ -353,9 +376,7 @@ class OSPlugin(Plugin):
 
     @export(property=True)
     def version(self) -> Optional[str]:
-        """Required OS function.
-
-        Implementations must be decorated with ``@export(property=True)``.
+        """Return the target's OS version.
 
         Returns:
             The OS version as string.
@@ -364,9 +385,7 @@ class OSPlugin(Plugin):
 
     @export(record=EmptyRecord)
     def users(self) -> list[Record]:
-        """Required OS function.
-
-        Implementations must be decorated with @export.
+        """Return the users available in the target.
 
         Returns:
             A list of user records.
@@ -375,9 +394,7 @@ class OSPlugin(Plugin):
 
     @export(property=True)
     def os(self) -> str:
-        """Required OS function.
-
-        Implementations must be decorated with ``@export(property=True)``.
+        """Return a slug of the target's OS name.
 
         Returns:
             A slug of the OS name, e.g. 'windows' or 'linux'.
@@ -386,9 +403,7 @@ class OSPlugin(Plugin):
 
     @export(property=True)
     def architecture(self) -> Optional[str]:
-        """Required OS function.
-
-        Implementations must be decorated with ``@export(property=True)``.
+        """Return a slug of the target's OS architecture.
 
         Returns:
             A slug of the OS architecture, e.g. 'x86_32-unix', 'MIPS-linux' or
@@ -417,15 +432,13 @@ def register(plugincls: Type[Plugin]) -> None:
     """Register a plugin, and put related data inside :attr:`PLUGINS`.
 
     This function uses the following private attributes that are set using decorators:
-
-    - ``__exported__``: Set in :func:`export`.
-    - ``__internal__``: Set in :func:`internal`.
+        - ``__exported__``: Set in :func:`export`.
+        - ``__internal__``: Set in :func:`internal`.
 
     Additionally, ``register`` sets the following private attributes on the `plugincls`:
-
-    - ``__plugin__``: Always set to ``True``.
-    - ``__functions__``: A list of all the methods and properties that are ``__internal__`` or ``__exported__``.
-    - ``__exports__``: A list of all the methods or properties that were explicitly exported.
+        - ``__plugin__``: Always set to ``True``.
+        - ``__functions__``: A list of all the methods and properties that are ``__internal__`` or ``__exported__``.
+        - ``__exports__``: A list of all the methods or properties that were explicitly exported.
 
     Args:
         plugincls: A plugin class to register.
@@ -438,6 +451,11 @@ def register(plugincls: Type[Plugin]) -> None:
 
     exports = []
     functions = []
+
+    # First pass to resolve aliases
+    for attr in get_nonprivate_attributes(plugincls):
+        for alias in getattr(attr, "__aliases__", []):
+            clone_alias(plugincls, attr, alias)
 
     for attr in get_nonprivate_attributes(plugincls):
         if isinstance(attr, property):
@@ -472,16 +490,8 @@ def register(plugincls: Type[Plugin]) -> None:
         elif issubclass(plugincls, ChildTargetPlugin):
             special_key = "_child"
 
-        if special_key not in root:
-            root[special_key] = []
-        else:
-            plugins = [obj for obj in root[special_key] if obj["class"] == plugincls.__name__]
-            if len(plugins):
-                return
-
-        special_root = {}
-        root[special_key].append(special_root)
-        root = special_root
+        root[special_key] = {}
+        root = root[special_key]
 
     # Check if the plugin was already registered
     if "class" in root and root["class"] == plugincls.__name__:
@@ -494,6 +504,7 @@ def register(plugincls: Type[Plugin]) -> None:
     root["exports"] = plugincls.__exports__
     root["namespace"] = plugincls.__namespace__
     root["fullname"] = ".".join((plugincls.__module__, plugincls.__qualname__))
+    root["is_osplugin"] = issubclass(plugincls, OSPlugin)
 
 
 def internal(*args, **kwargs) -> Callable:
@@ -540,74 +551,207 @@ def arg(*args, **kwargs) -> Callable:
     return decorator
 
 
-def plugins(osfilter: Optional[type[OSPlugin]] = None) -> Iterator[PluginDescriptor]:
-    """Retrieve all plugin descriptors.
+def alias(*args, **kwargs: dict[str, Any]) -> Callable:
+    """Decorator to be used on :class:`Plugin` functions to register an alias of that function."""
+
+    if not kwargs.get("name") and not args:
+        raise ValueError("Missing argument 'name'")
+
+    def decorator(obj: Callable) -> Callable:
+        if not hasattr(obj, "__aliases__"):
+            obj.__aliases__ = []
+
+        if name := (kwargs.get("name") or args[0]):
+            obj.__aliases__.append(name)
+
+        return obj
+
+    return decorator
+
+
+def clone_alias(cls: type, attr: Callable, alias: str) -> None:
+    """Clone the given attribute to an alias in the provided class."""
+
+    # Clone the function object
+    clone = type(attr)(attr.__code__, attr.__globals__, alias, attr.__defaults__, attr.__closure__)
+    clone.__kwdefaults__ = attr.__kwdefaults__
+
+    # Copy some attributes
+    functools.update_wrapper(clone, attr)
+    if wrapped := getattr(attr, "__wrapped__", None):
+        # update_wrapper sets a new wrapper, we want the original
+        clone.__wrapped__ = wrapped
+
+    # Update module path so we can fool inspect.getmodule with subclassed Plugin classes
+    clone.__module__ = cls.__module__
+
+    # Update the names
+    clone.__name__ = alias
+    clone.__qualname__ = f"{cls.__name__}.{alias}"
+
+    setattr(cls, alias, clone)
+
+
+def plugins(
+    osfilter: Optional[type[OSPlugin]] = None,
+    special_keys: set[str] = set(),
+    only_special_keys: bool = False,
+) -> Iterator[PluginDescriptor]:
+    """Walk the ``PLUGINS`` tree and return plugins.
+
+    If ``osfilter`` is specified, only plugins related to the provided
+    OSPlugin, or plugins with no OS relation are returned.
+    If ``osfilter`` is ``None``, all plugins will be returned.
+
+    One exception to this is if the ``osfilter`` is a (sub-)class of
+    DefaultPlugin, then plugins are returned as if no ``osfilter`` was
+    specified.
+
+    Another exeption to this are plugins in the ``PLUGINS`` tree which are
+    under a key that starts with a '_'. Those are only returned if their exact
+    key is specified in ``special_keys``.
+
+    An exception to these exceptions is in the case of ``OSPlugin`` (sub-)class
+    plugins and ``os_filter`` is not ``None``. These plugins live in the
+    ``PLUGINS`` tree under the ``_os`` special key. Those plugins are only
+    returned if they fully match the provided ``osfilter``.
+
+    The ``only_special_keys`` option returns only the plugins which are under a
+    special key that is defined in ``special_keys``. All filtering here will
+    happen as stated in the above cases.
 
     Args:
-        osfilter: The ``OSPlugin`` to use as template to find os specific plugins for.
+        osfilter: The optional OSPlugin to filter the returned plugins on.
+        special_keys: Also return plugins which are under the special ('_') keys in this set.
+        only_special_keys: Only return the plugins under the keys in ``special_keys`` and no others.
 
-    Returns:
-        An iterator of all plugin descriptors, optionally filtered on OS.
+    Yields:
+        Plugins in the ``PLUGINS`` tree based on the given filter criteria.
     """
 
-    def _walk(osfilter: str = None, root: dict = None) -> Iterator[PluginDescriptor]:
-        for key, obj in root.items():
-            if key.startswith("_"):
-                continue
+    if osfilter is not None:
+        # The PLUGINS tree does not include the hierarchy up to the plugins
+        # directory (dissect.target.plugins) for the built-in plugins. For the
+        # plugins in the directory specified in --plugin-path, the hierarchy
+        # starts at that directory.
+        #
+        # Built-in OSPlugins do have the dissect.target.plugins path in their
+        # module name, so it needs to be stripped, e.g.:
+        #   dissect.target.plugins.general.default -> general.default
+        #   dissect.target.plugins.windows._os -> plugins.windows._os
+        #
+        # The module name of OSPlugins from --plugin-path starts at the
+        # directory specified in that option, e.g.:
+        # --plugin-path=/some/path/, with a file foo/baros/_os.py
+        # will have a module name of: foo.baros._os
+        filter_path = _modulepath(osfilter).split(".")
 
-            if "functions" not in obj:
-                for plugin_desc in _walk(osfilter, obj):
-                    yield plugin_desc
-            else:
-                if osfilter and obj["module"].startswith("os") and not obj["module"].startswith(osfilter):
-                    continue
-
-                yield obj
-
-    if (
-        osfilter
-        and isinstance(osfilter, type)
-        and issubclass(osfilter, OSPlugin)
-        and not issubclass(osfilter, general.default.DefaultPlugin)
-        and osfilter.__module__.startswith(MODULE_PATH)
-    ):
-        osfilter, _, _ = osfilter.__module__.replace(MODULE_PATH, "", 1).strip(".").rpartition(".")
-
-        # Continue walking up the OS filter tree until we hit the second level
-        # As an example, it walk os.unix.debian, followed by os.unix, then exit
-        os_parts = osfilter.split(".")
-        while len(os_parts) >= 2:
-            yield from _walk(".".join(os_parts), _get_plugins())
-            os_parts.pop()
+        # If an OSPlugin is not defined in a file called _os.py, an extra `_os`
+        # part is added to the PLUGINS tree.
+        # For example the default OS plugin with module name general.default
+        # (after stripping of the build-in hierarchy) will be added at:
+        # general
+        #        \- default
+        #                  \- _os
+        # However the `_os` part is not in the module name. Modules that are
+        # defined in an _os.py file have the `_os` part in their module name.
+        # It is stripped out, so the filter is similar for both types of
+        # OSPlugin files.
+        if filter_path[-1] == "_os":
+            filter_path = filter_path[:-1]
     else:
-        yield from _walk(None, _get_plugins())
+        filter_path = []
 
-
-def _special_plugins(special_key: str) -> Iterator[PluginDescriptor]:
-    """Retrieve plugin descriptors stored under ``special_key``."""
-
-    def _walk(root=None):
+    def _walk(
+        root: dict,
+        special_keys: set[str] = set(),
+        only_special_keys: bool = False,
+        prev_module_path: list[str] = [],
+    ):
         for key, obj in root.items():
-            if key == special_key:
-                yield from obj
+            module_path = prev_module_path.copy()
+            module_path.append(key)
 
-            elif key.startswith("_"):
-                continue
+            # A branch in the PLUGINS tree is traversed to the next level if:
+            # - there are no filters (which in effect means all plugins are
+            # returned including all _os plugins).
+            # - the osfilter is the default plugin (which means all normal plugins but
+            # only the default _os plugin is returned).
+            # - there is no _os plugin on the next level (we're traversing a
+            # "normal" plugin branch or already jumped into an OS specific
+            # branch because of a filter_path match)
+            # - the current module_path fully matches the (beginning of) the
+            # filter path (this allows traversing into the specific os branch
+            # for the given os filter and any sub branches which are not os
+            # branches (of a sub-os) themselves).
+            if (
+                not filter_path
+                or issubclass(osfilter, general.default.DefaultPlugin)
+                or "_os" not in obj
+                or module_path == filter_path[: len(module_path)]
+            ):
+                if key.startswith("_"):
+                    if key in special_keys:
+                        # OSPlugins are treated special and are only returned
+                        # if their module_path matches the full filter_path.
+                        #
+                        # Note that the module_path includes the `_os` part,
+                        # which may have been explicitly added in the
+                        # hierarchy. This part needs to be stripped out when
+                        # matching against the filter_path, where it was either
+                        # not present or stripped out.
+                        if key != "_os" or (
+                            key == "_os" and (not filter_path or (filter_path and module_path[:-1] == filter_path))
+                        ):
+                            # If the special key is a leaf-node, we just give it back.
+                            # If it is a branch, we give back the full branch,
+                            # not just the special_keys if only_special_keys
+                            # was set to True.
+                            if "functions" in obj:
+                                yield obj
+                            else:
+                                yield from _walk(
+                                    obj,
+                                    special_keys=special_keys,
+                                    only_special_keys=False,
+                                    prev_module_path=module_path,
+                                )
+                        else:
+                            continue
+                    else:
+                        continue
 
-            elif "functions" not in obj:
-                yield from _walk(obj)
+                else:
+                    if "functions" in obj:
+                        if not (special_keys and only_special_keys):
+                            yield obj
+                    else:
+                        yield from _walk(
+                            obj,
+                            special_keys=special_keys,
+                            only_special_keys=only_special_keys,
+                            prev_module_path=module_path,
+                        )
 
-    yield from _walk(_get_plugins())
+    yield from sorted(
+        _walk(
+            _get_plugins(),
+            special_keys=special_keys,
+            only_special_keys=only_special_keys,
+        ),
+        key=lambda plugin: len(plugin["module"]),
+        reverse=True,
+    )
 
 
 def os_plugins() -> Iterator[PluginDescriptor]:
     """Retrieve all OS plugin descriptors."""
-    yield from _special_plugins("_os")
+    yield from plugins(special_keys={"_os"}, only_special_keys=True)
 
 
 def child_plugins() -> Iterator[PluginDescriptor]:
     """Retrieve all child plugin descriptors."""
-    yield from _special_plugins("_child")
+    yield from plugins(special_keys={"_child"}, only_special_keys=True)
 
 
 def lookup(func_name: str, osfilter: Optional[type[OSPlugin]] = None) -> Iterator[PluginDescriptor]:
@@ -645,7 +789,7 @@ def get_plugins_by_namespace(namespace: str, osfilter: Optional[type[OSPlugin]] 
             yield plugin_desc
 
 
-def load(plugin_desc: dict) -> Type[Plugin]:
+def load(plugin_desc: PluginDescriptor) -> Type[Plugin]:
     """Helper function that loads a plugin from a given plugin description.
 
     Args:
@@ -663,7 +807,7 @@ def load(plugin_desc: dict) -> Type[Plugin]:
         module = importlib.import_module(module)
         return getattr(module, plugin_desc["class"])
     except Exception as e:
-        raise PluginError(f"An exception occurred while trying to load a plugin: {module}", cause=e)
+        raise PluginError(f"An exception occurred while trying to load a plugin: {module}") from e
 
 
 def failed() -> list[dict[str, Any]]:
@@ -729,7 +873,7 @@ def load_module_from_name(module_path: str) -> None:
         # This will trigger the __init__subclass__() of the Plugin subclasses in the module.
         importlib.import_module(module_path)
     except Exception as e:
-        log.error("Unable to import %s", module_path)
+        log.info("Unable to import %s", module_path)
         log.debug("Error while trying to import module %s", module_path, exc_info=e)
         save_plugin_import_failure(module_path)
 
@@ -815,7 +959,8 @@ def _traverse(key: str, obj: dict[str, Any]) -> dict[str, Any]:
 
 def _modulepath(cls) -> str:
     """Returns the module path of a :class:`Plugin` relative to ``dissect.target.plugins``."""
-    return cls.__module__.replace(MODULE_PATH, "").lstrip(".")
+    module = getattr(cls, "__module__", "")
+    return module.replace(MODULE_PATH, "").lstrip(".")
 
 
 # These need to be at the bottom of the module because __init_subclass__ requires everything
@@ -837,6 +982,8 @@ class NamespacePlugin(Plugin):
             try:
                 subplugin = getattr(self.target, entry)
                 self._subplugins.append(subplugin)
+            except UnsupportedPluginError:
+                target.log.warning("Subplugin %s is not compatible with target.", entry)
             except Exception:
                 target.log.exception("Failed to load subplugin: %s", entry)
 
@@ -860,6 +1007,10 @@ class NamespacePlugin(Plugin):
         # the direct subclass of NamespacePlugin
         cls.__nsplugin__.SUBPLUGINS.add(cls.__namespace__)
 
+        # Generate a tuple of class names for which we do not want to add subplugin functions, which is the
+        # namespaceplugin and all of its superclasses (minus the base object).
+        reserved_cls_names = tuple({_class.__name__ for _class in cls.__nsplugin__.mro() if _class is not object})
+
         # Collect the public attrs of the subplugin
         for subplugin_func_name in cls.__exports__:
             subplugin_func = inspect.getattr_static(cls, subplugin_func_name)
@@ -869,15 +1020,18 @@ class NamespacePlugin(Plugin):
                 continue
 
             # The method needs to output records
-            if getattr(subplugin_func, "__output__", None) != "record":
+            if getattr(subplugin_func, "__output__", None) not in ["record", "yield"]:
                 continue
 
-            # The method needs to be part of the current subclass and not a parent
-            if not subplugin_func.__qualname__.startswith(cls.__name__):
+            # The method may not be part of a parent class.
+            if subplugin_func.__qualname__.startswith(reserved_cls_names):
                 continue
 
             # If we already have an aggregate method, skip
             if existing_aggregator := getattr(cls.__nsplugin__, subplugin_func_name, None):
+                if not hasattr(existing_aggregator, "__subplugins__"):
+                    # This is not an aggregator, but a re-implementation of a subclass function by the subplugin.
+                    continue
                 existing_aggregator.__subplugins__.append(cls.__namespace__)
                 continue
 
@@ -887,10 +1041,12 @@ class NamespacePlugin(Plugin):
                     for entry in aggregator.__subplugins__:
                         try:
                             subplugin = getattr(self.target, entry)
-                            for item in getattr(subplugin, method_name)():
-                                yield item
-                        except Exception:
+                            yield from getattr(subplugin, method_name)()
+                        except UnsupportedPluginError:
                             continue
+                        except Exception as e:
+                            self.target.log.error("Subplugin: %s raised an exception for: %s", entry, method_name)
+                            self.target.log.debug("Exception: %s", e, exc_info=e)
 
                 # Holds the subplugins that share this method
                 aggregator.__subplugins__ = []
@@ -950,6 +1106,9 @@ class NamespacePlugin(Plugin):
             cls.__init_subclass_namespace__(cls, **kwargs)
 
 
+__COMMON_PLUGIN_METHOD_NAMES__ = {attr.__name__ for attr in get_nonprivate_methods(Plugin)}
+
+
 class InternalPlugin(Plugin):
     """Parent class for internal plugins.
 
@@ -959,11 +1118,15 @@ class InternalPlugin(Plugin):
 
     def __init_subclass__(cls, **kwargs):
         for method in get_nonprivate_methods(cls):
-            if callable(method):
+            if callable(method) and method.__name__ not in __COMMON_PLUGIN_METHOD_NAMES__:
                 method.__internal__ = True
 
         super().__init_subclass__(**kwargs)
         return cls
+
+
+class InternalNamespacePlugin(NamespacePlugin, InternalPlugin):
+    pass
 
 
 @dataclass(frozen=True, eq=True)
@@ -973,54 +1136,73 @@ class PluginFunction:
     output_type: str
     class_object: type[Plugin]
     method_name: str
-    plugin_desc: dict = field(hash=False)
+    plugin_desc: PluginDescriptor = field(hash=False)
+
+    def __repr__(self) -> str:
+        return self.path
 
 
-def plugin_function_index(target: Target) -> tuple[dict[str, Any], set[str]]:
+def plugin_function_index(target: Optional[Target]) -> tuple[dict[str, PluginDescriptor], set[str]]:
     """Returns an index-list for plugins.
 
     This list is used to match CLI expressions against to find the desired plugin.
     Also returns the roots to determine whether a CLI expression has to be compared
     to the plugin tree or parsed using legacy rules.
     """
+
+    if target is None:
+        os_type = None
+    elif target._os_plugin is None:
+        os_type = general.default.DefaultPlugin
+    elif isinstance(target._os_plugin, type) and issubclass(target._os_plugin, OSPlugin):
+        os_type = target._os_plugin
+    elif isinstance(target._os_plugin, OSPlugin):
+        os_type = type(target._os_plugin)
+    else:
+        raise TypeError(
+            "target must be None or target._os_plugin must be either None, "
+            "a subclass of OSPlugin or an instance of OSPlugin"
+        )
+
     index = {}
     rootset = set()
 
-    def all_plugins():
-        # Filter out plugins based on the target os
-        os_type = type(target._os) if target._os and target._os.os != "default" else None
+    all_plugins = plugins(osfilter=os_type, special_keys={"_child", "_os"})
 
-        yield from plugins(os_type)
-        yield from os_plugins()
-        yield from child_plugins()  # Doesn't export anything but added for completeness.
-
-    for available_original in all_plugins():
+    for available_original in all_plugins:
         # Prevent modifying the global PLUGINS dict, otherwise -f os.windows._os.users fails for instance.
         available = available_original.copy()
-        if "get_all_records" in available["exports"]:
-            available["exports"].remove("get_all_records")
-        modulepath = available["module"]
 
-        if modulepath.endswith("._os"):
-            if not target._os:
-                # if no target available add a namespaceless section
+        modulepath = available["module"]
+        rootset.add(modulepath.split(".")[0])
+
+        if "get_all_records" in available["exports"]:
+            # The get_all_records does not only need to be not present in the
+            # index, it also needs to be removed from the exports list, else
+            # the 'plugins' plugin will still display them.
+            exports = available["exports"].copy()
+            exports.remove("get_all_records")
+            available["exports"] = exports
+
+            if "get_all_records" not in available_original["exports"]:
+                raise Exception(f"get_all_records removed from {available_original}")
+
+        for exported in available["exports"]:
+            if available["is_osplugin"] and os_type == general.default.DefaultPlugin:
+                # This makes the os plugin exports listed under the special
+                # "OS plugins" header by the 'plugins' plugin.
                 available["module"] = ""
-            elif target._os.__class__.__name__ != available["class"]:
-                continue
-            rootset.add(modulepath.split(".")[0])
-            for exported in available["exports"]:
-                index[f"{modulepath}.{exported}"] = available
-                index[exported] = available
-        else:
-            rootset.add(modulepath.split(".")[0])
-            for exported in available["exports"]:
-                index[f"{modulepath}.{exported}"] = available
+
+            index[f"{modulepath}.{exported}"] = available
 
     return index, rootset
 
 
 def find_plugin_functions(
-    target: Target, patterns: str, compatibility: bool = False, **kwargs
+    target: Optional[Target],
+    patterns: str,
+    compatibility: bool = False,
+    **kwargs,
 ) -> tuple[list[PluginFunction], set[str]]:
     """Finds plugins that match the target and the patterns.
 
@@ -1030,10 +1212,6 @@ def find_plugin_functions(
     """
     result = []
 
-    def add_to_result(func: PluginFunction) -> None:
-        if func not in result and not func.class_object.__skip__:
-            result.append(func)
-
     functions, rootset = plugin_function_index(target)
 
     invalid_funcs = set()
@@ -1041,29 +1219,45 @@ def find_plugin_functions(
     ignore_load_errors = kwargs.get("ignore_load_errors", False)
 
     for pattern in patterns.split(","):
-        # backward compatibility fix for namespace-level plugins (i.e. chrome)
+        # Backward compatibility fix for namespace-level plugins (i.e. chrome)
+        # If an exact namespace match is found, the pattern is changed to the tree to that namespace.
+        # Examples:
+        #     -f browser -> apps.browser.browser
+        #     -f iexplore -> apps.browser.iexplore
+        namespace_match = False
         for index_name, func in functions.items():
             if func["namespace"] == pattern:
-                pattern = func["module"] + "*"
+                pattern = func["module"]
+                namespace_match = True
+                break
 
         wildcard = any(char in pattern for char in ["*", "!", "?", "[", "]"])
         treematch = pattern.split(".")[0] in rootset and pattern != "os"
         exact_match = pattern in functions
 
-        # Allow for exact matches, otherwise you cannot reach documented namespace plugins like
-        # browsers.browser.downloads. You can *always* run these using the namespace/classic-style like:
-        # browser.downloads (but -l lists them in the tree for documentation purposes so it would be misleading
-        # not to allow tree access as well). Note that these tree items will never respond to wildcards though
-        # (browsers.browser.* won't work) to avoid duplicate results.
-        if exact_match:
+        # Allow for exact and namespace matches even if the plugin does not want to be found, otherwise you cannot
+        # reach documented namespace plugins like apps.browser.browser.downloads.
+        # You can *always* run these using the namespace/classic-style like: browser.downloads (but -l lists them
+        # in the tree for documentation purposes so it would be misleading not to allow tree access as well).
+        #
+        # Note that these tree items will never respond to wildcards though to avoid duplicate results, e.g. when
+        # querying apps.browser.*, this also means apps.browser.browser.* won't work.
+        if exact_match or namespace_match:
             show_hidden = True
 
-        if treematch and not wildcard and not exact_match:
-            # Examples:
-            #     -f browsers -> browsers* (the whole package)
-            #     -f apps.webservers.iis -> apps.webservers.iis* (logs etc)
-            # We do not include  a dot because that does not work if the full path is given:
-            #     -f apps.webservers.iis.logs != apps.webservers.iis.logs.* (does not work)
+        # Change the treematch pattern into an fnmatch-able pattern to give back all functions from the sub-tree
+        # (if there is a subtree).
+        #
+        # Examples:
+        #     -f browser -> apps.browser.browser* (the whole package, due to a namespace match)
+        #     -f apps.webservers.iis -> apps.webservers.iis* (logs etc)
+        #     -f apps.webservers.iis.logs -> apps.webservers.iis.logs* (only the logs, there is no subtree)
+        # We do not include a dot because that does not work if the full path is given:
+        #     -f apps.webservers.iis.logs != apps.webservers.iis.logs.* (does not work)
+        #
+        # In practice a namespace_match would almost always also be a treematch, except when the namespace plugin
+        # is in the root of the plugin tree.
+        if (treematch or namespace_match) and not wildcard and not exact_match:
             pattern += "*"
 
         if wildcard or treematch:
@@ -1086,6 +1280,8 @@ def find_plugin_functions(
                 fobject = inspect.getattr_static(loaded_plugin_object, method_name)
 
                 if compatibility:
+                    if target is None:
+                        continue
                     try:
                         if not loaded_plugin_object(target).is_compatible():
                             continue
@@ -1093,13 +1289,13 @@ def find_plugin_functions(
                         continue
 
                 matches = True
-                add_to_result(
+                result.append(
                     PluginFunction(
                         name=f"{func['namespace']}.{method_name}" if func["namespace"] else method_name,
                         path=index_name,
                         class_object=loaded_plugin_object,
                         method_name=method_name,
-                        output_type=getattr(fobject, "__output__", "text"),
+                        output_type=getattr(fobject, "__output__", "none"),
                         plugin_desc=func,
                     )
                 )
@@ -1116,9 +1312,9 @@ def find_plugin_functions(
                 namespace = None
 
             plugin_descriptions = []
-            for _, func in functions.items():
-                nsmatch = namespace and func["namespace"] == namespace and funcname in func["exports"]
-                fmatch = not namespace and not func["namespace"] and funcname in func["exports"]
+            for func_path, func in functions.items():
+                nsmatch = namespace and func["namespace"] == namespace and func_path.split(".")[-1] == funcname
+                fmatch = not namespace and not func["namespace"] and func_path.split(".")[-1] == funcname
                 if nsmatch or fmatch:
                     plugin_descriptions.append(func)
 
@@ -1138,13 +1334,13 @@ def find_plugin_functions(
                 if compatibility and not loaded_plugin_object(target).is_compatible():
                     continue
 
-                add_to_result(
+                result.append(
                     PluginFunction(
                         name=f"{description['namespace']}.{funcname}" if description["namespace"] else funcname,
                         path=f"{description['module']}.{funcname}",
                         class_object=loaded_plugin_object,
                         method_name=funcname,
-                        output_type=getattr(fobject, "__output__", "text"),
+                        output_type=getattr(fobject, "__output__", "none"),
                         plugin_desc=description,
                     )
                 )

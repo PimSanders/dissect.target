@@ -239,7 +239,7 @@ def open(item: Union[list, str, BinaryIO, Path], *args, **kwargs):
                 log.info("Failed to import %s", container)
                 log.debug("", exc_info=e)
             except Exception as e:
-                raise ContainerError(f"Failed to open container {item}", cause=e)
+                raise ContainerError(f"Failed to open container {item}") from e
     finally:
         if first_fh_opened:
             first_fh.close()
@@ -258,3 +258,4 @@ register("vdi", "VdiContainer")
 register("hdd", "HddContainer")
 register("hds", "HdsContainer")
 register("split", "SplitContainer")
+register("fortifw", "FortiFirmwareContainer")

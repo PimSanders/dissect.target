@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import datetime
 import re
 from functools import lru_cache
-from typing import Any, Generator, Optional
+from typing import Any, Iterator
 
 from dissect.eventlog import evtx
 from dissect.eventlog.exceptions import MalformedElfChnkException
@@ -19,7 +21,7 @@ EVTX_GLOB = "*.evtx"
 
 
 class EvtxPlugin(WindowsEventlogsMixin, plugin.Plugin):
-    """Plugin for fetching and parsing Windows Eventlog Files (*.evtx)"""
+    """Plugin for fetching and parsing Windows Eventlog Files (``*.evtx``)."""
 
     RECORD_NAME = "filesystem/windows/evtx"
     LOGS_DIR_PATH = "sysvol/windows/system32/winevt/logs"
@@ -29,15 +31,16 @@ class EvtxPlugin(WindowsEventlogsMixin, plugin.Plugin):
 
     def __init__(self, target):
         super().__init__(target)
+        self._create_event_descriptor = lru_cache(4096)(self._create_event_descriptor)
 
     @plugin.arg("--logs-dir", help="logs directory to scan")
     @plugin.arg("--log-file-glob", default=EVTX_GLOB, help="glob pattern to match a log file name")
     @plugin.export(record=DynamicDescriptor(["datetime"]))
-    def evtx(self, log_file_glob: str = EVTX_GLOB, logs_dir: Optional[str] = None) -> Generator[Record, None, None]:
-        """Return entries from Windows Event log files (*.evtx).
+    def evtx(self, log_file_glob: str = EVTX_GLOB, logs_dir: str | None = None) -> Iterator[DynamicDescriptor]:
+        """Return entries from Windows Event log files (``*.evtx``).
 
         Windows Event log is a detailed record of system, security and application notifications. It can be used to
-        diagnose a system or find future issues. Up until Windows XP the extension .evt was used, hereafter .evtx
+        diagnose a system or find future issues. Up until Windows XP the extension .evt was used, hereafter ``.evtx``
         became the new standard.
 
         References:
@@ -46,6 +49,9 @@ class EvtxPlugin(WindowsEventlogsMixin, plugin.Plugin):
 
         Yields dynamically created records based on the fields in the event.
         At least contains the following fields:
+
+        .. code-block:: text
+
             hostname (string): The target hostname.
             domain (string): The target domain.
             ts (datetime): The TimeCreated_SystemTime field of the event.
@@ -73,7 +79,7 @@ class EvtxPlugin(WindowsEventlogsMixin, plugin.Plugin):
                 yield self._build_record(event)
 
     @plugin.export(record=DynamicDescriptor(["datetime"]))
-    def scraped_evtx(self) -> Generator[Record, None, None]:
+    def scraped_evtx(self) -> Iterator[DynamicDescriptor]:
         """Return EVTX log file records scraped from target disks"""
         yield from self.target.scrape.scrape_chunks_from_disks(
             needle=self.NEEDLE,
@@ -81,7 +87,7 @@ class EvtxPlugin(WindowsEventlogsMixin, plugin.Plugin):
             chunk_parser=self._parse_chunk,
         )
 
-    def _parse_chunk(self, _, chunk: bytes) -> Generator[Any, None, None]:
+    def _parse_chunk(self, _, chunk: bytes) -> Iterator[Record]:
         chnk = evtx.ElfChnk(chunk)
         try:
             for event in chnk.read():
@@ -145,7 +151,6 @@ class EvtxPlugin(WindowsEventlogsMixin, plugin.Plugin):
         desc = self._create_event_descriptor(tuple(record_fields))
         return desc(**record_values)
 
-    @lru_cache(maxsize=4096)
     def _create_event_descriptor(self, record_fields) -> TargetRecordDescriptor:
         return TargetRecordDescriptor(self.RECORD_NAME, record_fields)
 

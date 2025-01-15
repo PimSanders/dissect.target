@@ -1,16 +1,15 @@
-import warnings
-from typing import Iterator, Union
+from __future__ import annotations
+
+from typing import Iterator
 
 from flow.record import GroupedRecord
 
-from dissect.target.exceptions import UnsupportedPluginError
+from dissect.target import Target
+from dissect.target.exceptions import InvalidTaskError, UnsupportedPluginError
 from dissect.target.helpers.record import DynamicDescriptor, TargetRecordDescriptor
 from dissect.target.plugin import Plugin, export
 from dissect.target.plugins.os.windows.task_helpers.tasks_job import AtTask
 from dissect.target.plugins.os.windows.task_helpers.tasks_xml import ScheduledTasks
-from dissect.target.target import Target
-
-warnings.simplefilter(action="ignore", category=FutureWarning)
 
 TaskRecord = TargetRecordDescriptor(
     "filesystem/windows/task",
@@ -42,7 +41,6 @@ TaskRecord = TargetRecordDescriptor(
         ("string", "run_level"),
         ("string", "process_token_sid_type"),
         ("string", "required_privileges"),
-        ("boolean", "allow_start_on_demand"),
         ("string", "restart_on_failure_interval"),
         ("string", "restart_on_failure_count"),
         ("string", "mutiple_instances_policy"),
@@ -115,21 +113,26 @@ class TasksPlugin(Plugin):
             raise UnsupportedPluginError("No task files")
 
     @export(record=DynamicDescriptor(["path", "datetime"]))
-    def tasks(self) -> Iterator[Union[TaskRecord, GroupedRecord]]:
+    def tasks(self) -> Iterator[TaskRecord | GroupedRecord]:
         """Return all scheduled tasks on a Windows system.
 
         On a Windows system, a scheduled task is a program or script that is executed on a specific time or at specific
         intervals. An adversary may leverage such scheduled tasks to gain persistence on a system.
 
         References:
-            https://en.wikipedia.org/wiki/Windows_Task_Scheduler
+            - https://en.wikipedia.org/wiki/Windows_Task_Scheduler
 
         Yields:
             The scheduled tasks found on the target.
         """
         for task_file in self.task_files:
             if not task_file.suffix or task_file.suffix == ".xml":
-                task_objects = ScheduledTasks(task_file).tasks
+                try:
+                    task_objects = ScheduledTasks(task_file).tasks
+                except InvalidTaskError as e:
+                    self.target.log.warning("Invalid task file encountered: %s", task_file)
+                    self.target.log.debug("", exc_info=e)
+                    continue
             else:
                 task_objects = [AtTask(task_file, self.target)]
 

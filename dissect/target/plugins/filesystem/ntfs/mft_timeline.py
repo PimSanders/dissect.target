@@ -93,6 +93,8 @@ def format_info(
 
 
 class MftTimelinePlugin(Plugin):
+    """NTFS MFT timeline plugin."""
+
     def check_compatible(self) -> None:
         ntfs_filesystems = [fs for fs in self.target.filesystems if fs.__type__ == "ntfs"]
         if not len(ntfs_filesystems):
@@ -100,10 +102,16 @@ class MftTimelinePlugin(Plugin):
 
     @export(output="yield")
     @arg("--ignore-dos", action="store_true", help="ignore DOS file names")
-    def mft_timeline(self, ignore_dos: bool = False):
+    def mft_timeline(self, ignore_dos: bool = False) -> Iterator[str]:
         """Return the MFT records of all NTFS filesystems in a human readable format (unsorted).
 
         The Master File Table (MFT) contains metadata about every file and folder on a NFTS filesystem.
+
+        If the filesystem is part of a virtual NTFS filesystem (a ``VirtualFilesystem`` with the MFT properties
+        added to it through a "fake" ``NtfsFilesystem``), the paths returned in the MFT records are based on the
+        mount point of the ``VirtualFilesystem``. This ensures that the proper original drive letter is used when
+        available.
+        When no drive letter can be determined, the path will show as e.g. ``\\$fs$\\fs0``.
 
         References:
             - https://docs.microsoft.com/en-us/windows/win32/fileio/master-file-table
@@ -112,6 +120,10 @@ class MftTimelinePlugin(Plugin):
             if fs.__type__ != "ntfs":
                 continue
 
+            # If this filesystem is a "fake" NTFS filesystem, used to enhance a
+            # VirtualFilesystem, The driveletter (more accurate mount point)
+            # returned will be that of the VirtualFilesystem. This makes sure
+            # the paths returned in the records are actually reachable.
             drive_letter = get_drive_letter(self.target, fs)
             extras = Extras(
                 serial=fs.ntfs.serial,

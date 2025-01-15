@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import warnings
 from typing import Iterator, Optional
 from xml.etree.ElementTree import Element
@@ -157,8 +159,8 @@ class XmlTask:
         return data
 
     def get_element(
-        self, xml_path: str, xml_data: Optional[Element] = None, attribute: Optional[str] = None
-    ) -> Optional[str]:
+        self, xml_path: str, xml_data: Element | None = None, attribute: Optional[str] = None
+    ) -> str | None:
         """Get the value of the specified XML element.
 
         Args:
@@ -179,7 +181,7 @@ class XmlTask:
 
         return data.text
 
-    def get_raw(self, xml_path: Optional[str] = None) -> str:
+    def get_raw(self, xml_path: str | None = None) -> str:
         """Get the raw XML data of the specified element.
 
         Args:
@@ -189,7 +191,7 @@ class XmlTask:
             bytes: The raw XML data as string of the element if found, otherwise None.
         """
         data = self.task_element.find(xml_path) if xml_path else self.task_element
-        if data:
+        if data is not None:
             return ElementTree.tostring(data, encoding="utf-8").strip()
 
     def get_triggers(self) -> Iterator[GroupedRecord]:

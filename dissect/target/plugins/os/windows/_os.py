@@ -1,13 +1,24 @@
 from __future__ import annotations
 
+import operator
 import struct
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator
+
+from flow.record.fieldtypes import windows_path
 
 from dissect.target.exceptions import RegistryError, RegistryValueNotFoundError
 from dissect.target.filesystem import Filesystem
 from dissect.target.helpers.record import WindowsUserRecord
 from dissect.target.plugin import OperatingSystem, OSPlugin, export
 from dissect.target.target import Target
+
+ARCH_MAP = {
+    "x86": 32,
+    "IA64": 64,
+    "ARM64": 64,
+    "EM64T": 64,
+    "AMD64": 64,
+}
 
 
 class WindowsPlugin(OSPlugin):
@@ -19,8 +30,13 @@ class WindowsPlugin(OSPlugin):
         # Just run this here for now
         self.add_mounts()
 
+        target.props["sysvol_drive"] = next(
+            (mnt for mnt, fs in target.fs.mounts.items() if fs is target.fs.mounts.get("sysvol") and mnt != "sysvol"),
+            None,
+        )
+
     @classmethod
-    def detect(cls, target: Target) -> Optional[Filesystem]:
+    def detect(cls, target: Target) -> Filesystem | None:
         for fs in target.filesystems:
             if fs.exists("/windows/system32") or fs.exists("/winnt"):
                 return fs
@@ -32,17 +48,11 @@ class WindowsPlugin(OSPlugin):
         target.fs.case_sensitive = False
         target.fs.alt_separator = "\\"
         target.fs.mount("sysvol", sysvol)
-        target.fs.mount("c:", sysvol)
 
         if not sysvol.exists("boot/BCD"):
             for fs in target.filesystems:
-                if fs.exists("boot") and fs.exists("boot/BCD"):
+                if fs.exists("boot/BCD") or fs.exists("EFI/Microsoft/Boot/BCD"):
                     target.fs.mount("efi", fs)
-
-        if target.fs.exists("sysvol/windows"):
-            target.windir = target.fs.get("sysvol/windows")
-        else:
-            target.windir = target.fs.get("sysvol/winnt")
 
         return cls(target)
 
@@ -58,14 +68,12 @@ class WindowsPlugin(OSPlugin):
                     p = name.lower()[1:].split("\\")
                     if p[0] == "dosdevices":
                         drive = p[1]
-                        if drive == "c:":
-                            continue
 
                         if value.startswith(b"DMIO:ID:"):
                             guid = value[8:]
 
                             for volume in self.target.volumes:
-                                if volume.guid == guid:
+                                if volume.guid == guid and volume.fs:
                                     self.target.fs.mount(drive, volume.fs)
 
                         elif len(value) == 12:
@@ -80,8 +88,19 @@ class WindowsPlugin(OSPlugin):
             self.target.log.warning("Failed to map drive letters")
             self.target.log.debug("", exc_info=e)
 
+        sysvol_drive = self.target.fs.mounts.get("sysvol")
+        if not sysvol_drive:
+            self.target.log.warning("No sysvol drive found")
+        elif operator.countOf(self.target.fs.mounts.values(), sysvol_drive) == 1:
+            # Fallback mount the sysvol to C: if we didn't manage to mount it to any other drive letter
+            if "c:" not in self.target.fs.mounts:
+                self.target.log.debug("Unable to determine drive letter of sysvol, falling back to C:")
+                self.target.fs.mount("c:", sysvol_drive)
+            else:
+                self.target.log.warning("Unknown drive letter for sysvol")
+
     @export(property=True)
-    def hostname(self) -> Optional[str]:
+    def hostname(self) -> str | None:
         key = "HKLM\\SYSTEM\\ControlSet001\\Control\\Computername\\Computername"
         try:
             return self.target.registry.value(key, "Computername").value
@@ -90,28 +109,7 @@ class WindowsPlugin(OSPlugin):
 
     @export(property=True)
     def ips(self) -> list[str]:
-        key = "HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces"
-        fields = ["IPAddress", "DhcpIPAddress"]
-        ips = set()
-
-        for r in self.target.registry.keys(key):
-            for s in r.subkeys():
-                for field in fields:
-                    try:
-                        ip = s.value(field).value
-                    except RegistryValueNotFoundError:
-                        continue
-
-                    if isinstance(ip, str):
-                        ip = [ip]
-
-                    for i in ip:
-                        if i == "0.0.0.0":
-                            continue
-
-                        ips.add(i)
-
-        return list(ips)
+        return list(set(map(str, self.target.network.ips())))
 
     def _get_version_reg_value(self, value_name: str) -> Any:
         try:
@@ -121,7 +119,7 @@ class WindowsPlugin(OSPlugin):
 
         return value
 
-    def _legacy_current_version(self) -> Optional[str]:
+    def _legacy_current_version(self) -> str | None:
         """Returns the NT version as used up to and including NT 6.3.
 
         This corresponds with Windows 8 / Windows 2012 Server.
@@ -133,7 +131,7 @@ class WindowsPlugin(OSPlugin):
         """
         return self._get_version_reg_value("CurrentVersion")
 
-    def _major_version(self) -> Optional[int]:
+    def _major_version(self) -> int | None:
         """Return the NT major version number (starting from NT 10.0 / Windows 10).
 
         Returns:
@@ -143,7 +141,7 @@ class WindowsPlugin(OSPlugin):
         """
         return self._get_version_reg_value("CurrentMajorVersionNumber")
 
-    def _minor_version(self) -> Optional[int]:
+    def _minor_version(self) -> int | None:
         """Return the NT minor version number (starting from NT 10.0 / Windows 10).
 
         Returns:
@@ -153,7 +151,7 @@ class WindowsPlugin(OSPlugin):
         """
         return self._get_version_reg_value("CurrentMinorVersionNumber")
 
-    def _nt_version(self) -> Optional[int]:
+    def _nt_version(self) -> int | None:
         """Return the Windows NT version in x.y format.
 
         For systems up to and including NT 6.3 (Win 8 / Win 2012 Server) this
@@ -181,7 +179,7 @@ class WindowsPlugin(OSPlugin):
         return version
 
     @export(property=True)
-    def version(self) -> Optional[str]:
+    def version(self) -> str | None:
         """Return a string representation of the Windows version of the target.
 
         For Windows versions before Windows 10 this looks like::
@@ -238,13 +236,21 @@ class WindowsPlugin(OSPlugin):
         if any(map(lambda value: value is not None, version_parts.values())):
             version = []
 
-            prodcut_name = _part_str(version_parts, "ProductName")
-            version.append(prodcut_name)
-
             nt_version = _part_str(version_parts, "CurrentVersion")
+            build_version = _part_str(version_parts, "CurrentBuildNumber")
+            prodcut_name = _part_str(version_parts, "ProductName")
+
+            # CurrentBuildNumber >= 22000 on NT 10.0 indicates Windows 11.
+            # https://learn.microsoft.com/en-us/windows/release-health/windows11-release-information
+            try:
+                if nt_version == "10.0" and int(build_version) >= 22_000:
+                    prodcut_name = prodcut_name.replace("Windows 10", "Windows 11")
+            except ValueError:
+                pass
+
+            version.append(prodcut_name)
             version.append(f"(NT {nt_version})")
 
-            build_version = _part_str(version_parts, "CurrentBuildNumber")
             ubr = version_parts["UBR"]
             if ubr:
                 build_version = f"{build_version}.{ubr}"
@@ -259,7 +265,7 @@ class WindowsPlugin(OSPlugin):
         return version_string
 
     @export(property=True)
-    def architecture(self) -> Optional[str]:
+    def architecture(self) -> str | None:
         """
         Returns a dict containing the architecture and bitness of the system
 
@@ -267,19 +273,11 @@ class WindowsPlugin(OSPlugin):
             Dict: arch: architecture, bitness: bits
         """
 
-        arch_strings = {
-            "x86": 32,
-            "IA64": 64,
-            "ARM64": 64,
-            "EM64T": 64,
-            "AMD64": 64,
-        }
-
         key = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment"
 
         try:
             arch = self.target.registry.key(key).value("PROCESSOR_ARCHITECTURE").value
-            bits = arch_strings.get(arch)
+            bits = ARCH_MAP.get(arch)
 
             # return {"arch": arch, "bitness": bits}
             if bits == 64:
@@ -316,7 +314,7 @@ class WindowsPlugin(OSPlugin):
                 yield WindowsUserRecord(
                     sid=subkey.name,
                     name=name,
-                    home=home,
+                    home=windows_path(home),
                     _target=self.target,
                 )
 

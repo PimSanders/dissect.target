@@ -8,6 +8,8 @@ log = logging.getLogger(__name__)
 
 
 class KeyType(Enum):
+    """Valid key types."""
+
     RAW = "raw"
     PASSPHRASE = "passphrase"
     RECOVERY_KEY = "recovery_key"
@@ -19,12 +21,15 @@ class Key(NamedTuple):
     value: Union[str, bytes]
     provider: str = None
     identifier: str = None
+    is_wildcard: bool = False
 
 
 KEYCHAIN: list[Key] = []
 
 
-def register_key(key_type: KeyType, value: str, identifier: str = None, provider: str = None) -> None:
+def register_key(
+    key_type: KeyType, value: str, identifier: str = None, provider: str = None, is_wildcard: bool = False
+) -> None:
     if key_type == KeyType.RAW:
         try:
             value = bytes.fromhex(value)
@@ -32,7 +37,10 @@ def register_key(key_type: KeyType, value: str, identifier: str = None, provider
             log.warning("Failed to decode raw key as hex, ignoring: %s", value)
             return
 
-    key = Key(key_type, value, provider, identifier)
+    if key_type in (KeyType.RECOVERY_KEY, KeyType.FILE):
+        value = value.strip("\"'")
+
+    key = Key(key_type, value, provider, identifier, is_wildcard)
     KEYCHAIN.append(key)
     log.info("Registered key %s", key)
 
@@ -58,7 +66,7 @@ def parse_key_type(key_type_name: str) -> KeyType:
 
 def register_wildcard_value(value: str) -> None:
     for key_type in KeyType:
-        register_key(key_type, value)
+        register_key(key_type, value, is_wildcard=True)
 
 
 def register_keychain_file(keychain_path: Path) -> None:
@@ -83,6 +91,9 @@ def register_keychain_file(keychain_path: Path) -> None:
     with keychain_path.open(mode="r") as fh:
         rows = csv.reader(fh)
         for row in rows:
+            # Skip comment rows (starting with #)
+            if row[0].startswith("#"):
+                continue
             if len(row) != 4:
                 log.warning("Expecting 4 values per row in a keychain CSV file, found %d: %s. Skipping", len(row), row)
                 continue

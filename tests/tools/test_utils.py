@@ -2,7 +2,16 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from dissect.target.tools.utils import persist_execution_report
+import pytest
+
+from dissect.target.exceptions import UnsupportedPluginError
+from dissect.target.plugin import arg, find_plugin_functions
+from dissect.target.tools.utils import (
+    args_to_uri,
+    generate_argparse_for_unbound_method,
+    get_target_attribute,
+    persist_execution_report,
+)
 
 
 def test_persist_execution_report():
@@ -25,6 +34,61 @@ def test_persist_execution_report():
             assert full_path.suffix == ".json"
             assert "2000-01-01-000000" in full_path.name
 
-            mocked_json_dumps.called_once_with(report_data)
+            mocked_json_dumps.assert_called_once_with(report_data, sort_keys=True, indent=4)
 
             mocked_write_text.assert_called_once_with(test_output)
+
+
+@pytest.mark.parametrize(
+    "targets, loader_name, rest, uris",
+    [
+        (["/path/to/somewhere"], "loader", ["--loader-option", "1"], ["loader:///path/to/somewhere?option=1"]),
+        (["/path/to/somewhere"], "loader", ["--loader-option", "2"], ["loader:///path/to/somewhere?option=2"]),
+        (["/path/to/somewhere"], "unknown", ["--unknown-option", "3"], ["unknown:///path/to/somewhere"]),
+        (["/path/to/somewhere"], "loader", ["--ignored-option", "4"], ["loader:///path/to/somewhere"]),
+        (["/path/to/somewhere"], "loader", [], ["loader:///path/to/somewhere"]),
+        (["/path/to/somewhere"], "invalid", [], ["invalid:///path/to/somewhere"]),
+    ],
+)
+def test_args_to_uri(targets: list[str], loader_name: str, rest: list[str], uris: list[str]) -> None:
+    @arg("--loader-option", dest="option")
+    class FakeLoader:
+        pass
+
+    with patch("dissect.target.tools.utils.LOADERS_BY_SCHEME", {"loader": FakeLoader}):
+        assert args_to_uri(targets, loader_name, rest) == uris
+
+
+@pytest.mark.parametrize(
+    "pattern, expected_function",
+    [
+        ("passwords", "dissect.target.plugins.os.unix.shadow.ShadowPlugin"),
+        ("firefox.passwords", "Unsupported function `firefox` for target"),
+    ],
+)
+def test_plugin_name_confusion_regression(target_unix_users, pattern, expected_function):
+    plugins, _ = find_plugin_functions(target_unix_users, pattern)
+    assert len(plugins) == 1
+
+    # We don't expect these functions to work since our target_unix_users fixture
+    # does not include the neccesary artifacts for them to work. However we are
+    # only interested in the plugin or namespace that was called so we check
+    # the exception stack trace.
+    with pytest.raises(UnsupportedPluginError) as exc_info:
+        get_target_attribute(target_unix_users, plugins[0])
+
+    assert expected_function in str(exc_info.value)
+
+
+def test_plugin_mutual_exclusive_arguments():
+    fargs = [
+        (("--aa",), {"group": "aa"}),
+        (("--bb",), {"group": "aa"}),
+        (("--cc",), {"group": "bb"}),
+        (("--dd",), {"group": "bb"}),
+    ]
+    method = test_plugin_mutual_exclusive_arguments
+    setattr(method, "__args__", fargs)
+    with patch("inspect.isfunction", return_value=True):
+        parser = generate_argparse_for_unbound_method(method)
+    assert len(parser._mutually_exclusive_groups) == 2

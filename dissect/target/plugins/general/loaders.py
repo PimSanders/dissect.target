@@ -1,8 +1,8 @@
-import itertools
+import json
 
 from dissect.target.helpers.docs import INDENT_STEP, get_docstring
-from dissect.target.loader import LOADERS, DirLoader
-from dissect.target.plugin import Plugin, export
+from dissect.target.loader import LOADERS_BY_SCHEME
+from dissect.target.plugin import Plugin, arg, export
 
 
 class LoaderListPlugin(Plugin):
@@ -12,17 +12,28 @@ class LoaderListPlugin(Plugin):
         pass
 
     @export(output="none")
-    def loaders(self):
+    # NOTE: We would prefer to re-use arguments across plugins from argparse in query.py, but that is not possible yet.
+    # For now we use --as-json, but in the future this should be changed to inherit --json from target-query.
+    # https://github.com/fox-it/dissect.target/pull/841
+    # https://github.com/fox-it/dissect.target/issues/889
+    @arg("--as-json", dest="as_json", action="store_true")
+    def loaders(self, as_json: bool = False) -> None:
         """List the available loaders."""
 
         loaders_info = {}
-        for loader in itertools.chain(LOADERS, [DirLoader]):
+        for key, loader in LOADERS_BY_SCHEME.items():
             try:
                 docstring = get_docstring(loader, "No documentation.").splitlines()[0].strip()
-                loaders_info[loader.__name__] = docstring
+                loaders_info[key] = docstring
             except ImportError:
                 continue
 
-        print("Available loaders:")
-        for loader_name, loader_description in sorted(loaders_info.items()):
-            print(f"{INDENT_STEP}{loader_name} - {loader_description}")
+        loaders = sorted(loaders_info.items())
+
+        if as_json:
+            print(json.dumps([{"name": name, "description": desc} for name, desc in loaders]), end="")
+
+        else:
+            print("Available loaders:")
+            for loader_name, loader_description in loaders:
+                print(f"{INDENT_STEP}{loader_name} - {loader_description}")

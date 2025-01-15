@@ -14,16 +14,21 @@ def test_missing_hives(fs_win: VirtualFilesystem, caplog: LogCaptureFixture) -> 
     target = Target()
     target.filesystems.add(fs_win)
 
-    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, target.log.name)
     target.apply()
 
-    expected = [
-        f"{target}: Could not find hive: sysvol/windows/system32/config/{hive}" for hive in RegistryPlugin.SYSTEM
+    expected = []
+
+    base_paths = [
+        "sysvol/windows/system32/config",
+        "sysvol/WINNT/system32/config",
+        "sysvol/windows",
+        "sysvol/reactos",
+        "sysvol/windows/system32/config/RegBack",
     ]
-    expected += [
-        f"{target}: Could not find hive: sysvol/windows/system32/config/RegBack/{hive}"
-        for hive in RegistryPlugin.SYSTEM
-    ]
+
+    for base_path in base_paths:
+        expected += [f"{target}: Could not find hive: {base_path}/{hive}" for hive in RegistryPlugin.SYSTEM]
 
     assert [record.message for record in caplog.records if record.filename == "registry.py"] == expected
 
@@ -31,7 +36,7 @@ def test_missing_hives(fs_win: VirtualFilesystem, caplog: LogCaptureFixture) -> 
 def test_missing_user_hives(fs_win: VirtualFilesystem, target_win_users: Target, caplog: LogCaptureFixture) -> None:
     fs_win.makedirs("Users/John")
 
-    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, target_win_users.log.name)
     target_win_users.registry.load_user_hives()
 
     assert [record.message for record in caplog.records if record.filename == "registry.py"] == [
@@ -47,7 +52,7 @@ def test_empty_hives(fs_win: VirtualFilesystem, caplog: LogCaptureFixture) -> No
     target = Target()
     target.filesystems.add(fs_win)
 
-    caplog.set_level(logging.WARNING)
+    caplog.set_level(logging.WARNING, target.log.name)
     target.apply()
 
     assert [record.message for record in caplog.records if record.filename == "registry.py"] == [
@@ -65,7 +70,7 @@ def test_empty_hives_skip_warning(fs_win: VirtualFilesystem, caplog: LogCaptureF
     target = Target()
     target.filesystems.add(fs_win)
 
-    caplog.set_level(logging.WARNING)
+    caplog.set_level(logging.WARNING, target.log.name)
 
     with patch("dissect.target.plugins.os.windows.registry.RegfHive"):
         target.apply()
@@ -77,7 +82,7 @@ def test_empty_user_hives(fs_win: VirtualFilesystem, target_win_users: Target, c
     fs_win.map_file_fh("Users/John/ntuser.dat", BytesIO())
     fs_win.map_file_fh("Users/John/AppData/Local/Microsoft/Windows/usrclass.dat", BytesIO())
 
-    caplog.set_level(logging.WARNING)
+    caplog.set_level(logging.WARNING, target_win_users.log.name)
     target_win_users.registry.load_user_hives()
 
     assert [record.message for record in caplog.records if record.filename == "registry.py"] == [

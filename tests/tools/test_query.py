@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from typing import Any, Optional
@@ -160,7 +161,7 @@ def mock_find_plugin_function(
             PluginFunction(
                 name=pattern,
                 output_type="record",
-                path="",
+                path=pattern,
                 class_object=MagicMock(),
                 method_name=pattern,
                 plugin_desc={},
@@ -199,6 +200,11 @@ def test_target_query_filtered_functions(monkeypatch: pytest.MonkeyPatch) -> Non
                 side_effect=mock_find_plugin_function,
             ),
             patch(
+                "dissect.target.tools.utils.find_plugin_functions",
+                autospec=True,
+                side_effect=mock_find_plugin_function,
+            ),
+            patch(
                 "dissect.target.tools.query.execute_function_on_target",
                 autospec=True,
                 side_effect=mock_execute_function,
@@ -233,4 +239,62 @@ def test_target_query_dry_run(capsys: pytest.CaptureFixture, monkeypatch: pytest
         target_query()
         out, _ = capsys.readouterr()
 
-        assert out == f"Dry run on: <Target {target_file}>\n  execute: osinfo (general.osinfo.osinfo)\n"
+        assert out == (
+            f"Dry run on: <Target {target_file}>\n"
+            "  execute: users (general.default.users)\n"
+            "  execute: network.interfaces (general.network.interfaces)\n"
+            "  execute: osinfo (general.osinfo.osinfo)\n"
+        )
+
+
+def test_target_query_list_json(capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    """test if target-query --list --json output is formatted as we expect it to be."""
+
+    with monkeypatch.context() as m:
+        m.setattr("sys.argv", ["target-query", "-l", "-j"])
+        with pytest.raises((SystemExit, IndexError, ImportError)):
+            target_query()
+        out, _ = capsys.readouterr()
+
+    try:
+        output = json.loads(out)
+    except json.JSONDecodeError:
+        pass
+
+    # test the generic structure of the returned dictionary.
+    assert isinstance(output, dict), "Could not load JSON output of 'target-query --list --json'"
+    assert output["plugins"], "Expected a dictionary of plugins"
+    assert output["loaders"], "Expected a dictionary of loaders"
+    assert len(output["plugins"]["loaded"]) > 200, "Expected more loaded plugins"
+    assert not output["plugins"].get("failed"), "Some plugin(s) failed to initialize"
+
+    def get_plugin(plugins: list[dict], needle: str) -> dict:
+        match = [p for p in output["plugins"]["loaded"] if p["name"] == needle]
+        return match[0] if match else False
+
+    # general plugin
+    users_plugin = get_plugin(output, "users")
+    assert users_plugin == {
+        "name": "users",
+        "description": "Return the users available in the target.",
+        "output": "record",
+        "path": "general.default.users",
+    }
+
+    # namespaced plugin
+    plocate_plugin = get_plugin(output, "plocate.locate")
+    assert plocate_plugin == {
+        "name": "plocate.locate",
+        "description": "Yield file and directory names from the plocate.db.",
+        "output": "record",
+        "path": "os.unix.locate.plocate.locate",
+    }
+
+    # regular plugin
+    sam_plugin = get_plugin(output, "sam")
+    assert sam_plugin == {
+        "name": "sam",
+        "description": "Dump SAM entries",
+        "output": "record",
+        "path": "os.windows.credential.sam.sam",
+    }

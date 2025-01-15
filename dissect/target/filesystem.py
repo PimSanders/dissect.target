@@ -4,20 +4,10 @@ import gzip
 import io
 import logging
 import os
+import pathlib
 import stat
-import warnings
 from collections import defaultdict
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    BinaryIO,
-    Callable,
-    Iterator,
-    List,
-    Optional,
-    Type,
-    Union,
-)
+from typing import TYPE_CHECKING, Any, BinaryIO, Callable, Iterator, Optional, Type
 
 from dissect.target.exceptions import (
     FileNotFoundError,
@@ -28,6 +18,8 @@ from dissect.target.exceptions import (
 )
 from dissect.target.helpers import fsutil, hashutil
 from dissect.target.helpers.lazy import import_lazy
+
+TarFilesystem = import_lazy("dissect.target.filesystems.tar").TarFilesystem
 
 if TYPE_CHECKING:
     from dissect.target.target import Target
@@ -50,7 +42,7 @@ class Filesystem:
 
     def __init__(
         self,
-        volume: Optional[Union[BinaryIO, list[BinaryIO]]] = None,
+        volume: Optional[BinaryIO | list[BinaryIO]] = None,
         alt_separator: str = "",
         case_sensitive: bool = True,
     ) -> None:
@@ -73,15 +65,6 @@ class Filesystem:
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__}>"
-
-    @classmethod
-    @property
-    def __fstype__(cls) -> str:
-        warnings.warn(
-            "The __fstype__ attribute is deprecated and will be removed in dissect.target 3.15. Use __type__ instead",
-            category=DeprecationWarning,
-        )
-        return cls.__type__
 
     def path(self, *args) -> fsutil.TargetPath:
         """Instantiate a new path-like object on this filesystem."""
@@ -217,7 +200,7 @@ class Filesystem:
         """
         return self.get(path).scandir()
 
-    def listdir(self, path: str) -> List[str]:
+    def listdir(self, path: str) -> list[str]:
         """List the contents of a directory as strings.
 
         Args:
@@ -228,7 +211,7 @@ class Filesystem:
         """
         return list(self.iterdir(path))
 
-    def listdir_ext(self, path: str) -> List[FilesystemEntry]:
+    def listdir_ext(self, path: str) -> list[FilesystemEntry]:
         """List the contents of a directory as FilesystemEntry's.
 
         Args:
@@ -245,10 +228,9 @@ class Filesystem:
         topdown: bool = True,
         onerror: Optional[Callable] = None,
         followlinks: bool = False,
-    ) -> Iterator[str]:
-        """Walk a directory pointed to by ``path``, returning the string representation of both files and directories.
-
-        It walks across all the files inside ``path`` recursively.
+    ) -> Iterator[tuple[str, list[str], list[str]]]:
+        """Recursively walk a directory pointed to by ``path``, returning the string representation of both files
+        and directories.
 
         Args:
             path: The path to walk on the filesystem.
@@ -267,10 +249,9 @@ class Filesystem:
         topdown: bool = True,
         onerror: Optional[Callable] = None,
         followlinks: bool = False,
-    ) -> Iterator[FilesystemEntry]:
-        """Walk a directory pointed to by ``path``, returning FilesystemEntry's of both files and directories.
-
-        It walks across all the files inside ``path`` recursively.
+    ) -> Iterator[tuple[list[FilesystemEntry], list[FilesystemEntry], list[FilesystemEntry]]]:
+        """Recursively walk a directory pointed to by ``path``, returning :class:`FilesystemEntry` of files
+        and directories.
 
         Args:
             path: The path to walk on the filesystem.
@@ -282,6 +263,19 @@ class Filesystem:
             An iterator of directory entries as FilesystemEntry's.
         """
         return self.get(path).walk_ext(topdown, onerror, followlinks)
+
+    def recurse(self, path: str) -> Iterator[FilesystemEntry]:
+        """Recursively walk a directory and yield contents as :class:`FilesystemEntry`.
+
+        Does not follow symbolic links.
+
+        Args:
+            path: The path to recursively walk on the target filesystem.
+
+        Returns:
+            An iterator of :class:`FilesystemEntry`.
+        """
+        return self.get(path).recurse()
 
     def glob(self, pattern: str) -> Iterator[str]:
         """Iterate over the directory part of ``pattern``, returning entries matching ``pattern`` as strings.
@@ -487,7 +481,7 @@ class Filesystem:
         """
         return self.get(path).sha256()
 
-    def hash(self, path: str, algos: Optional[Union[List[str], List[Callable]]] = None) -> tuple[str]:
+    def hash(self, path: str, algos: Optional[list[str] | list[Callable]] = None) -> tuple[str]:
         """Calculate the digest of the contents of ``path``, using the ``algos`` algorithms.
 
         Args:
@@ -532,21 +526,21 @@ class FilesystemEntry:
             follow_symlinks: Whether to resolve the entry if it is a symbolic link.
 
         Returns:
-            The resolved symbolic link if ``follow_symlinks`` is ``True`` and the ``FilesystemEntry`` is a
-            symbolic link or else the ``FilesystemEntry`` itself.
+            The resolved symbolic link if ``follow_symlinks`` is ``True`` and the :class:`FilesystemEntry` is a
+            symbolic link or else the :class:`FilesystemEntry` itself.
         """
         if follow_symlinks and self.is_symlink():
             return self.readlink_ext()
         return self
 
     def get(self, path: str) -> FilesystemEntry:
-        """Retrieve a FilesystemEntry relative to this entry.
+        """Retrieve a :class:`FilesystemEntry` relative to this entry.
 
         Args:
             path: The path relative to this filesystem entry.
 
         Returns:
-            A relative FilesystemEntry.
+            A relative :class:`FilesystemEntry`.
         """
         raise NotImplementedError()
 
@@ -567,14 +561,14 @@ class FilesystemEntry:
         raise NotImplementedError()
 
     def scandir(self) -> Iterator[FilesystemEntry]:
-        """Iterate over the contents of a directory, return them as FilesystemEntry's.
+        """Iterate over the contents of a directory, yields :class:`FilesystemEntry`.
 
         Returns:
-            An iterator of directory entries as FilesystemEntry's.
+            An iterator of :class:`FilesystemEntry`.
         """
         raise NotImplementedError()
 
-    def listdir(self) -> List[str]:
+    def listdir(self) -> list[str]:
         """List the contents of a directory as strings.
 
         Returns:
@@ -582,11 +576,11 @@ class FilesystemEntry:
         """
         return list(self.iterdir())
 
-    def listdir_ext(self) -> List[FilesystemEntry]:
-        """List the contents of a directory as FilesystemEntry's.
+    def listdir_ext(self) -> list[FilesystemEntry]:
+        """List the contents of a directory as a list of :class:`FilesystemEntry`.
 
         Returns:
-            A list of FilesystemEntry's.
+            A list of :class:`FilesystemEntry`.
         """
         return list(self.scandir())
 
@@ -595,10 +589,9 @@ class FilesystemEntry:
         topdown: bool = True,
         onerror: Optional[Callable] = None,
         followlinks: bool = False,
-    ) -> Iterator[str]:
-        """Walk a directory and list its contents as strings.
-
-        It walks across all the files inside the entry recursively.
+    ) -> Iterator[tuple[str, list[str], list[str]]]:
+        """Recursively walk a directory and yield its contents as strings split in a tuple
+        of lists of files, directories and symlinks.
 
         These contents include::
           - files
@@ -620,15 +613,9 @@ class FilesystemEntry:
         topdown: bool = True,
         onerror: Optional[Callable] = None,
         followlinks: bool = False,
-    ) -> Iterator[FilesystemEntry]:
-        """Walk a directory and show its contents as FilesystemEntry's.
-
-        It walks across all the files inside the entry recursively.
-
-        These contents include::
-          - files
-          - directories
-          - symboliclinks
+    ) -> Iterator[tuple[list[FilesystemEntry], list[FilesystemEntry], list[FilesystemEntry]]]:
+        """Recursively walk a directory and yield its contents as :class:`FilesystemEntry` split in a tuple of
+        lists of files, directories and symlinks.
 
         Args:
             topdown: ``True`` puts this entry at the top of the list, ``False`` puts this entry at the bottom.
@@ -636,11 +623,21 @@ class FilesystemEntry:
             followlinks: ``True`` if we want to follow any symbolic link
 
         Returns:
-            An iterator of directory entries as FilesystemEntry's.
+            An iterator of tuples :class:`FilesystemEntry`.
         """
         yield from fsutil.walk_ext(self, topdown, onerror, followlinks)
 
-    def glob(self, pattern) -> Iterator[str]:
+    def recurse(self) -> Iterator[FilesystemEntry]:
+        """Recursively walk a directory and yield its contents as :class:`FilesystemEntry`.
+
+        Does not follow symbolic links.
+
+        Returns:
+            An iterator of :class:`FilesystemEntry`.
+        """
+        yield from fsutil.recurse(self)
+
+    def glob(self, pattern: str) -> Iterator[str]:
         """Iterate over this directory part of ``patern``, returning entries matching ``pattern`` as strings.
 
         Args:
@@ -652,21 +649,23 @@ class FilesystemEntry:
         for entry in self.glob_ext(pattern):
             yield entry.path
 
-    def glob_ext(self, pattern) -> Iterator[FilesystemEntry]:
-        """Iterate over the directory part of ``pattern``, returning entries matching ``pattern`` as FilesysmteEntry's.
+    def glob_ext(self, pattern: str) -> Iterator[FilesystemEntry]:
+        """Iterate over the directory part of ``pattern``, returning entries matching
+        ``pattern`` as :class:`FilesysmteEntry`.
 
         Args:
             pattern: The pattern to glob for.
 
         Returns:
-            An iterator of FilesystemEntry's that match the pattern.
+            An iterator of :class:`FilesystemEntry` that match the pattern.
         """
         yield from fsutil.glob_ext(self, pattern)
 
     def exists(self, path: str) -> bool:
         """Determines whether a ``path``, relative to this entry, exists.
 
-        If the `path` is a symbolic link, it will attempt to resolve it to find the FilesystemEntry it points to.
+        If the `path` is a symbolic link, it will attempt to resolve it to find
+        the :class:`FilesystemEntry` it points to.
 
         Args:
             path: The path relative to this entry.
@@ -744,7 +743,7 @@ class FilesystemEntry:
         raise NotImplementedError()
 
     def readlink_ext(self) -> FilesystemEntry:
-        """Read the link where this entry points to, return the resulting path as FilesystemEntry.
+        """Read the link where this entry points to, return the resulting path as :class:`FilesystemEntry`.
 
         If it is a symlink and returns the string that corresponds to that path.
         This means it follows the path a link points to, it tries to do it recursively.
@@ -754,7 +753,7 @@ class FilesystemEntry:
         """
         log.debug("%r::readlink_ext()", self)
         # Default behavior, resolve link own filesystem.
-        return fsutil.resolve_link(fs=self.fs, entry=self)
+        return fsutil.resolve_link(self.fs, self.readlink(), self.path, alt_separator=self.fs.alt_separator)
 
     def stat(self, follow_symlinks: bool = True) -> fsutil.stat_result:
         """Determine the stat information of this entry.
@@ -823,7 +822,7 @@ class FilesystemEntry:
         """
         return hashutil.sha256(self.open())
 
-    def hash(self, algos: Optional[Union[List[str], List[Callable]]] = None) -> tuple[str]:
+    def hash(self, algos: Optional[list[str] | list[Callable]] = None) -> tuple[str]:
         """Calculate the digest of this entry, using the ``algos`` algorithms.
 
         Args:
@@ -867,7 +866,7 @@ class VirtualDirectory(FilesystemEntry):
         raise TypeError(f"lattr is not allowed on VirtualDirectory: {self.path}")
 
     def add(self, name: str, entry: FilesystemEntry) -> None:
-        """Add an entry to this VirtualDirectory."""
+        """Add an entry to this :class:`VirtualDirectory`."""
         if not self.fs.case_sensitive:
             name = name.lower()
 
@@ -906,7 +905,7 @@ class VirtualDirectory(FilesystemEntry):
 
     def _stat(self) -> fsutil.stat_result:
         path_addr = fsutil.generate_addr(self.path, alt_separator=self.fs.alt_separator)
-        return fsutil.stat_result([stat.S_IFDIR, path_addr, id(self.fs), 0, 0, 0, 0, 0, 0, 0])
+        return fsutil.stat_result([stat.S_IFDIR, path_addr, id(self.fs), 1, 0, 0, 0, 0, 0, 0])
 
     def stat(self, follow_symlinks: bool = True) -> fsutil.stat_result:
         if self.top:
@@ -928,10 +927,10 @@ class VirtualDirectory(FilesystemEntry):
         return False
 
     def readlink(self) -> str:
-        raise NotASymlinkError()
+        raise NotASymlinkError(self.path)
 
     def readlink_ext(self) -> FilesystemEntry:
-        raise NotASymlinkError()
+        raise NotASymlinkError(self.path)
 
 
 class VirtualFileHandle(io.RawIOBase):
@@ -994,10 +993,10 @@ class VirtualFile(FilesystemEntry):
         return False
 
     def readlink(self) -> str:
-        raise FilesystemError(f"{self.__class__.__name__} does not support symlinks.")
+        raise NotASymlinkError(self.path)
 
     def readlink_ext(self) -> FilesystemEntry:
-        raise FilesystemError(f"{self.__class__.__name__} does not support symlinks.")
+        raise NotASymlinkError(self.path)
 
 
 class MappedFile(VirtualFile):
@@ -1073,13 +1072,19 @@ class VirtualSymlink(FilesystemEntry):
         if not follow_symlinks:
             return False
 
-        return self.readlink_ext().is_dir()
+        try:
+            return self.readlink_ext().is_dir()
+        except FileNotFoundError:
+            return False
 
     def is_file(self, follow_symlinks: bool = True) -> bool:
         if not follow_symlinks:
             return False
 
-        return self.readlink_ext().is_file()
+        try:
+            return self.readlink_ext().is_file()
+        except FileNotFoundError:
+            return False
 
     def is_symlink(self) -> bool:
         return True
@@ -1137,7 +1142,7 @@ class VirtualFilesystem(Filesystem):
                     try:
                         return entry.top.get(fsutil.join(*parts[i:], alt_separator=self.alt_separator))
                     except FilesystemError as e:
-                        raise FileNotFoundError(full_path, cause=e)
+                        raise FileNotFoundError(full_path) from e
                 else:
                     raise FileNotFoundError(full_path)
 
@@ -1215,7 +1220,7 @@ class VirtualFilesystem(Filesystem):
         self.map_file_entry(vfspath, VirtualFile(self, file_path, fh))
 
     def map_file_entry(self, vfspath: str, entry: FilesystemEntry) -> None:
-        """Map a FilesystemEntry into the VFS.
+        """Map a :class:`FilesystemEntry` into the VFS.
 
         Any missing subdirectories up to, but not including, the last part of
         ``vfspath`` will be created.
@@ -1233,76 +1238,191 @@ class VirtualFilesystem(Filesystem):
             entry_name = fsutil.basename(vfspath, alt_separator=self.alt_separator)
             directory.add(entry_name, entry)
 
+    def map_dir_from_tar(self, vfspath: str, tar_file: str | pathlib.Path, map_single_file: bool = False) -> None:
+        """Map files in a tar onto the VFS.
+
+        Args:
+            vfspath: Destination path in the virtual filesystem.
+            tar_file: Source path of the tar file to map.
+            map_single_file: Only mount a single file found inside the tar at the specified path.
+        """
+
+        if not isinstance(tar_file, pathlib.Path):
+            try:
+                tar_file = pathlib.Path(tar_file)
+            except TypeError:
+                raise ValueError("tar_file should be a string or Path instance")
+
+        vfspath = fsutil.normalize(vfspath, alt_separator=self.alt_separator)
+        tfs = TarFilesystem(tar_file.open("rb"))
+
+        if map_single_file:
+            # We map the first file we find in the tar to the provided vfspath.
+            for file in [f[0] for _, _, f in tfs.walk_ext("/") if f]:
+                file.name = fsutil.basename(vfspath)
+                self.map_file_entry(vfspath, file)
+                return
+        else:
+            self.mount(vfspath, tfs)
+
+    def map_file_from_tar(self, vfspath: str, tar_file: str | pathlib.Path) -> None:
+        """Map a single file in a tar archive to the given path in the VFS.
+
+        The provided tar archive should contain *one* file.
+
+        Args:
+            vfspath: Destination path in the virtual filesystem.
+            tar_file: Source path of the tar file to map.
+        """
+        return self.map_dir_from_tar(vfspath.lstrip("/"), tar_file, map_single_file=True)
+
     def link(self, src: str, dst: str) -> None:
-        """Hard link a FilesystemEntry to another location."""
+        """Hard link a :class:`FilesystemEntry` to another location.
+
+        Args:
+            src: The path to the target of the link.
+            dst: The path to the link.
+        """
         self.map_file_entry(dst, self.get(src))
 
     def symlink(self, src: str, dst: str) -> None:
-        """Create a symlink to another location."""
-        src = fsutil.normalize(src, alt_separator=self.alt_separator).strip("/")
+        """Create a symlink to another location.
+
+        Args:
+            src: The path to the target of the symlink.
+            dst: The path to the symlink.
+        """
+        src = fsutil.normalize(src, alt_separator=self.alt_separator).rstrip("/")
         dst = fsutil.normalize(dst, alt_separator=self.alt_separator).strip("/")
         self.map_file_entry(dst, VirtualSymlink(self, dst, src))
 
 
-class RootFilesystem(Filesystem):
-    __type__ = "root"
+class LayerFilesystem(Filesystem):
+    __type__ = "layer"
 
-    def __init__(self, target: Target):
-        self.target = target
-        self.layers = []
+    def __init__(self, **kwargs):
+        self.layers: list[Filesystem] = []
         self.mounts = {}
         self._alt_separator = "/"
         self._case_sensitive = True
-        self._root_entry = RootFilesystemEntry(self, "/", [])
-        self.root = self.add_layer()
-        super().__init__(None)
+        self._root_entry = LayerFilesystemEntry(self, "/", [])
+        self.root = self.append_layer()
+        super().__init__(None, **kwargs)
+
+    def __getattr__(self, attr: str) -> Any:
+        """Provide "magic" access to filesystem specific attributes from any of the layers.
+
+        For example, on a :class:`LayerFilesystem` ``fs``, you can do ``fs.ntfs`` to access the
+        internal NTFS object if it has an NTFS layer.
+        """
+        for fs in self.layers:
+            try:
+                return getattr(fs, attr)
+            except AttributeError:
+                continue
+        else:
+            return object.__getattribute__(self, attr)
 
     @staticmethod
     def detect(fh: BinaryIO) -> bool:
-        raise TypeError("Detect is not allowed on RootFilesystem class")
+        raise TypeError("Detect is not allowed on LayerFilesystem class")
 
-    def mount(self, path: str, fs: Filesystem) -> None:
+    def mount(self, path: str, fs: Filesystem, ignore_existing: bool = True) -> None:
         """Mount a filesystem at a given path.
 
         If there's an overlap with an existing mount, creates a new layer.
+
+        Args:
+            path: The path to mount the filesystem at.
+            fs: The filesystem to mount.
+            ignore_existing: Whether to ignore existing mounts and create a new layer. Defaults to ``True``.
         """
         root = self.root
         for mount in self.mounts.keys():
-            if path == mount:
+            if ignore_existing and path == mount:
                 continue
 
             if path.startswith(mount):
-                root = self.add_layer()
+                root = self.append_layer()
                 break
 
         root.map_fs(path, fs)
         self.mounts[path] = fs
 
     def link(self, dst: str, src: str) -> None:
-        """Hard link a RootFilesystemEntry to another location."""
-        dst = fsutil.normalize(dst, alt_separator=self.alt_separator)
+        """Hard link a :class:`FilesystemEntry` to another location."""
         self.root.map_file_entry(dst, self.get(src))
 
     def symlink(self, dst: str, src: str) -> None:
         """Create a symlink to another location."""
         self.root.symlink(dst, src)
 
-    def add_layer(self, **kwargs) -> VirtualFilesystem:
+    def append_layer(self, **kwargs) -> VirtualFilesystem:
+        """Append a new layer."""
         layer = VirtualFilesystem(case_sensitive=self.case_sensitive, alt_separator=self.alt_separator, **kwargs)
-        self.layers.append(layer)
-        self._root_entry.entries.append(layer.root)
+        self.append_fs_layer(layer)
         return layer
+
+    add_layer = append_layer
+
+    def prepend_layer(self, **kwargs) -> VirtualFilesystem:
+        """Prepend a new layer."""
+        layer = VirtualFilesystem(case_sensitive=self.case_sensitive, alt_separator=self.alt_separator, **kwargs)
+        self.prepend_fs_layer(layer)
+        return layer
+
+    def append_fs_layer(self, fs: Filesystem) -> None:
+        """Append a filesystem as a layer.
+
+        Args:
+            fs: The filesystem to append.
+        """
+        # Counterintuitively, we prepend the filesystem to the list of layers
+        # We could reverse the list of layers upon iteration, but that is a hot path
+        self.layers.insert(0, fs)
+        self._root_entry.entries.insert(0, fs.get("/"))
+
+    def prepend_fs_layer(self, fs: Filesystem) -> None:
+        """Prepend a filesystem as a layer.
+
+        Args:
+            fs: The filesystem to prepend.
+        """
+        # Counterintuitively, we append the filesystem to the list of layers
+        # We could reverse the list of layers upon iteration, but that is a hot path
+        self.layers.append(fs)
+        self._root_entry.entries.append(fs.get("/"))
+
+    def remove_fs_layer(self, fs: Filesystem) -> None:
+        """Remove a filesystem layer.
+
+        Args:
+            fs: The filesystem to remove.
+        """
+        self.remove_layer(self.layers.index(fs))
+
+    def remove_layer(self, idx: int) -> None:
+        """Remove a layer by index.
+
+        Args:
+            idx: The index of the layer to remove.
+        """
+        del self.layers[idx]
+        del self._root_entry.entries[idx]
 
     @property
     def case_sensitive(self) -> bool:
+        """Whether the filesystem is case sensitive."""
         return self._case_sensitive
 
     @property
     def alt_separator(self) -> str:
+        """The alternative separator of the filesystem."""
         return self._alt_separator
 
     @case_sensitive.setter
     def case_sensitive(self, value: bool) -> None:
+        """Set the case sensitivity of the filesystem (and all layers)."""
         self._case_sensitive = value
         self.root.case_sensitive = value
         for layer in self.layers:
@@ -1310,14 +1430,14 @@ class RootFilesystem(Filesystem):
 
     @alt_separator.setter
     def alt_separator(self, value: str) -> None:
+        """Set the alternative separator of the filesystem (and all layers)."""
         self._alt_separator = value
         self.root.alt_separator = value
         for layer in self.layers:
             layer.alt_separator = value
 
-    def get(self, path: str, relentry: FilesystemEntry = None) -> FilesystemEntry:
-        self.target.log.debug("%r::get(%r)", self, path)
-
+    def get(self, path: str, relentry: Optional[LayerFilesystemEntry] = None) -> LayerFilesystemEntry:
+        """Get a :class:`FilesystemEntry` from the filesystem."""
         entry = relentry or self._root_entry
         path = fsutil.normalize(path, alt_separator=self.alt_separator).strip("/")
         full_path = fsutil.join(entry.path, path, alt_separator=self.alt_separator)
@@ -1341,15 +1461,21 @@ class RootFilesystem(Filesystem):
                 raise NotASymlinkError(full_path)
             raise FileNotFoundError(full_path)
 
-        return RootFilesystemEntry(self, full_path, entries)
+        return LayerFilesystemEntry(self, full_path, entries)
 
     def _get_from_entry(self, path: str, entry: FilesystemEntry) -> FilesystemEntry:
+        """Get a :class:`FilesystemEntry` relative to a specific entry."""
         parts = path.split("/")
 
-        for part in parts:
+        for i, part in enumerate(parts):
             if entry.is_symlink():
                 # Resolve using the RootFilesystem instead of the entry's Filesystem
-                entry = fsutil.resolve_link(fs=self, entry=entry)
+                entry = fsutil.resolve_link(
+                    self,
+                    entry.readlink(),
+                    "/".join(parts[:i]),
+                    alt_separator=entry.fs.alt_separator,
+                )
             entry = entry.get(part)
 
         return entry
@@ -1358,11 +1484,11 @@ class RootFilesystem(Filesystem):
 class EntryList(list):
     """Wrapper list for filesystem entries.
 
-    Expose a getattr on a list of items. Useful in cases where
-    there's a virtual filesystem entry as well as a real one.
+    Exposes a ``__getattr__`` on a list of items. Useful to access internal objects from filesystem implementations.
+    For example, access the underlying NTFS object from a list of virtual and NTFS entries.
     """
 
-    def __init__(self, value: Any):
+    def __init__(self, value: FilesystemEntry | list[FilesystemEntry]):
         if not isinstance(value, list):
             value = [value]
         super().__init__(value)
@@ -1377,19 +1503,11 @@ class EntryList(list):
             return object.__getattribute__(self, attr)
 
 
-class RootFilesystemEntry(FilesystemEntry):
+class LayerFilesystemEntry(FilesystemEntry):
     def __init__(self, fs: Filesystem, path: str, entry: FilesystemEntry):
         super().__init__(fs, path, EntryList(entry))
-        self.entries = self.entry
+        self.entries: EntryList = self.entry
         self._link = None
-
-    def __getattr__(self, attr):
-        for entry in self.entries:
-            try:
-                return getattr(entry, attr)
-            except AttributeError:
-                continue
-        return object.__getattribute__(self, attr)
 
     def _exec(self, func: str, *args, **kwargs) -> Any:
         """Helper method to execute a method over all contained entries."""
@@ -1404,18 +1522,16 @@ class RootFilesystemEntry(FilesystemEntry):
             exceptions = ",".join(exc)
         else:
             exceptions = "No entries"
+
         raise FilesystemError(f"Can't resolve {func} for {self}: {exceptions}")
 
     def get(self, path: str) -> FilesystemEntry:
-        self.fs.target.log.debug("%r::get(%r)", self, path)
         return self.fs.get(path, self._resolve())
 
     def open(self) -> BinaryIO:
-        self.fs.target.log.debug("%r::open()", self)
         return self._resolve()._exec("open")
 
     def iterdir(self) -> Iterator[str]:
-        self.fs.target.log.debug("%r::iterdir()", self)
         yielded = {".", ".."}
         selfentry = self._resolve()
         for fsentry in selfentry.entries:
@@ -1427,8 +1543,7 @@ class RootFilesystemEntry(FilesystemEntry):
                 yield entry_name
                 yielded.add(name)
 
-    def scandir(self) -> Iterator[FilesystemEntry]:
-        self.fs.target.log.debug("%r::scandir()", self)
+    def scandir(self) -> Iterator[LayerFilesystemEntry]:
         # Every entry is actually a list of entries from the different
         # overlaying FSes, of which each may implement a different function
         # like .stat() or .open()
@@ -1448,47 +1563,113 @@ class RootFilesystemEntry(FilesystemEntry):
             # overlaying FSes may have different casing of the name.
             entry_name = entries[0].name
             path = fsutil.join(selfentry.path, entry_name, alt_separator=selfentry.fs.alt_separator)
-            yield RootFilesystemEntry(selfentry.fs, path, entries)
+            yield LayerFilesystemEntry(selfentry.fs, path, entries)
 
     def is_file(self, follow_symlinks: bool = True) -> bool:
-        self.fs.target.log.debug("%r::is_file()", self)
         try:
             return self._resolve(follow_symlinks=follow_symlinks)._exec("is_file", follow_symlinks=follow_symlinks)
         except FileNotFoundError:
             return False
 
     def is_dir(self, follow_symlinks: bool = True) -> bool:
-        self.fs.target.log.debug("%r::is_dir()", self)
         try:
             return self._resolve(follow_symlinks=follow_symlinks)._exec("is_dir", follow_symlinks=follow_symlinks)
         except FileNotFoundError:
             return False
 
     def is_symlink(self) -> bool:
-        self.fs.target.log.debug("%r::is_symlink()", self)
         return self._exec("is_symlink")
 
     def readlink(self) -> str:
-        self.fs.target.log.debug("%r::readlink()", self)
         if not self.is_symlink():
-            raise FilesystemError(f"Not a link: {self}")
+            raise NotASymlinkError(f"Not a link: {self}")
         return self._exec("readlink")
 
     def stat(self, follow_symlinks: bool = True) -> fsutil.stat_result:
-        self.fs.target.log.debug("%r::stat()", self)
         return self._resolve(follow_symlinks=follow_symlinks)._exec("stat", follow_symlinks=follow_symlinks)
 
     def lstat(self) -> fsutil.stat_result:
-        self.fs.target.log.debug("%r::lstat()", self)
         return self._exec("lstat")
 
     def attr(self) -> Any:
-        self.fs.target.log.debug("%r::attr()", self)
         return self._resolve()._exec("attr")
 
     def lattr(self) -> Any:
-        self.fs.target.log.debug("%r::lattr()", self)
         return self._exec("lattr")
+
+
+class RootFilesystem(LayerFilesystem):
+    __type__ = "root"
+
+    def __init__(self, target: Target):
+        self.target = target
+        super().__init__()
+
+    @staticmethod
+    def detect(fh: BinaryIO) -> bool:
+        raise TypeError("Detect is not allowed on RootFilesystem class")
+
+    def get(self, path: str, relentry: Optional[LayerFilesystemEntry] = None) -> RootFilesystemEntry:
+        self.target.log.debug("%r::get(%r)", self, path)
+        entry = super().get(path, relentry)
+        entry.__class__ = RootFilesystemEntry
+        return entry
+
+
+class RootFilesystemEntry(LayerFilesystemEntry):
+    fs: RootFilesystem
+
+    def get(self, path: str) -> RootFilesystemEntry:
+        self.fs.target.log.debug("%r::get(%r)", self, path)
+        entry = super().get(path)
+        entry.__class__ = RootFilesystemEntry
+        return entry
+
+    def open(self) -> BinaryIO:
+        self.fs.target.log.debug("%r::open()", self)
+        return super().open()
+
+    def iterdir(self) -> Iterator[str]:
+        self.fs.target.log.debug("%r::iterdir()", self)
+        yield from super().iterdir()
+
+    def scandir(self) -> Iterator[RootFilesystemEntry]:
+        self.fs.target.log.debug("%r::scandir()", self)
+        for entry in super().scandir():
+            entry.__class__ = RootFilesystemEntry
+            yield entry
+
+    def is_file(self, follow_symlinks: bool = True) -> bool:
+        self.fs.target.log.debug("%r::is_file()", self)
+        return super().is_file(follow_symlinks=follow_symlinks)
+
+    def is_dir(self, follow_symlinks: bool = True) -> bool:
+        self.fs.target.log.debug("%r::is_dir()", self)
+        return super().is_dir(follow_symlinks=follow_symlinks)
+
+    def is_symlink(self) -> bool:
+        self.fs.target.log.debug("%r::is_symlink()", self)
+        return super().is_symlink()
+
+    def readlink(self) -> str:
+        self.fs.target.log.debug("%r::readlink()", self)
+        return super().readlink()
+
+    def stat(self, follow_symlinks: bool = True) -> fsutil.stat_result:
+        self.fs.target.log.debug("%r::stat()", self)
+        return super().stat(follow_symlinks=follow_symlinks)
+
+    def lstat(self) -> fsutil.stat_result:
+        self.fs.target.log.debug("%r::lstat()", self)
+        return super().lstat()
+
+    def attr(self) -> Any:
+        self.fs.target.log.debug("%r::attr()", self)
+        return super().attr()
+
+    def lattr(self) -> Any:
+        self.fs.target.log.debug("%r::lattr()", self)
+        return super().lattr()
 
 
 def register(module: str, class_name: str, internal: bool = True) -> None:
@@ -1533,6 +1714,8 @@ def open(fh: BinaryIO, *args, **kwargs) -> Filesystem:
             except ImportError as e:
                 log.info("Failed to import %s", filesystem)
                 log.debug("", exc_info=e)
+            except Exception as e:
+                raise FilesystemError(f"Failed to open filesystem for {fh}") from e
     finally:
         fh.seek(offset)
 
@@ -1571,4 +1754,8 @@ register("btrfs", "BtrfsFilesystem")
 register("exfat", "ExfatFilesystem")
 register("squashfs", "SquashFSFilesystem")
 register("zip", "ZipFilesystem")
+register("tar", "TarFilesystem")
+register("vmtar", "VmtarFilesystem")
+register("cpio", "CpioFilesystem")
 register("ad1", "AD1Filesystem")
+register("jffs", "JFFSFilesystem")

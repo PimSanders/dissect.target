@@ -28,9 +28,9 @@ except ImportError:
 try:
     from Crypto.Cipher import AES
 
-    HAS_PYCRYPTODOME = True
+    HAS_CRYPTO = True
 except ImportError:
-    HAS_PYCRYPTODOME = False
+    HAS_CRYPTO = False
 
 
 DOMAIN_TRANSLATION = {
@@ -163,8 +163,10 @@ class ITunesBackup:
 
     def files(self) -> Iterator[FileInfo]:
         """Iterate all the files in this backup."""
-        for row in self.manifest_db.table("Files").rows():
-            yield FileInfo(self, row.fileID, row.domain, row.relativePath, row.flags, row.file)
+
+        if table := self.manifest_db.table("Files"):
+            for row in table.rows():
+                yield FileInfo(self, row.fileID, row.domain, row.relativePath, row.flags, row.file)
 
 
 class FileInfo:
@@ -288,7 +290,7 @@ def translate_file_path(domain: str, relative_path: str) -> str:
         package_name = ""
 
     domain_path = fsutil.join(DOMAIN_TRANSLATION.get(domain, domain), package_name)
-    return fsutil.join(domain_path, relative_path)
+    return fsutil.join(domain_path, relative_path).rstrip("/")
 
 
 def parse_key_bag(buf: bytes) -> tuple[dict[str, bytes, int], dict[str, ClassKey]]:
@@ -383,7 +385,7 @@ def _create_cipher(key: bytes, iv: bytes = b"\x00" * 16, mode: str = "cbc") -> A
             raise ValueError(f"Invalid key size: {key_size}")
 
         return _pystandalone.cipher(f"aes-{key_size * 8}-{mode}", key, iv)
-    elif HAS_PYCRYPTODOME:
+    elif HAS_CRYPTO:
         mode_map = {
             "cbc": (AES.MODE_CBC, True),
             "ecb": (AES.MODE_ECB, False),

@@ -10,9 +10,12 @@ from flow.record.base import RE_VALID_FIELD_NAME
 from dissect.target import plugin
 from dissect.target.exceptions import FileNotFoundError as DissectFileNotFoundError
 from dissect.target.exceptions import PluginError, UnsupportedPluginError
-from dissect.target.helpers import fsutil
+from dissect.target.helpers.fsutil import has_glob_magic
 from dissect.target.helpers.record import TargetRecordDescriptor
-from dissect.target.plugins.apps.webserver.webserver import WebserverAccessLogRecord
+from dissect.target.plugins.apps.webserver.webserver import (
+    WebserverAccessLogRecord,
+    WebserverPlugin,
+)
 
 LOG_RECORD_NAME = "filesystem/windows/iis/logs"
 
@@ -42,7 +45,7 @@ BasicRecordDescriptor = TargetRecordDescriptor(LOG_RECORD_NAME, BASIC_RECORD_FIE
 FIELD_NAME_INVALID_CHARS_RE = re.compile(r"[^a-zA-Z0-9]")
 
 
-class IISLogsPlugin(plugin.Plugin):
+class IISLogsPlugin(WebserverPlugin):
     """IIS 7 (and above) logs plugin.
 
     References:
@@ -52,22 +55,33 @@ class IISLogsPlugin(plugin.Plugin):
 
     APPLICATION_HOST_CONFIG = "sysvol/windows/system32/inetsrv/config/applicationHost.config"
 
+    DEFAULT_LOG_PATHS = [
+        "sysvol\\Windows\\System32\\LogFiles\\W3SVC*\\*.log",
+        "sysvol\\Windows.old\\Windows\\System32\\LogFiles\\W3SVC*\\*.log",
+        "sysvol\\inetpub\\logs\\LogFiles\\*.log",
+        "sysvol\\inetpub\\logs\\LogFiles\\W3SVC*\\*.log",
+        "sysvol\\Resources\\Directory\\*\\LogFiles\\Web\\W3SVC*\\*.log",
+    ]
+
     __namespace__ = "iis"
 
     def __init__(self, target):
         super().__init__(target)
         self.config = self.target.fs.path(self.APPLICATION_HOST_CONFIG)
+        self.log_dirs = self.get_log_dirs()
+
+        self._create_extended_descriptor = lru_cache(4096)(self._create_extended_descriptor)
 
     def check_compatible(self) -> None:
-        if not self.config.exists() and not self.target.fs.path("sysvol/files").exists():
-            raise UnsupportedPluginError("No ApplicationHost config file found")
+        if not self.log_dirs:
+            raise UnsupportedPluginError("No IIS log files found")
 
     @plugin.internal
-    def get_log_dirs(self) -> list[tuple[str, str]]:
-        log_paths = []
+    def get_log_dirs(self) -> list[tuple[str, Path]]:
+        log_paths = set()
 
-        if self.target.fs.path("sysvol/files").exists():
-            log_paths.append(("auto", "sysvol/files"))
+        if (sysvol_files := self.target.fs.path("sysvol/files")).exists():
+            log_paths.add(("auto", sysvol_files))
 
         try:
             xml_data = ElementTree.fromstring(self.config.open().read(), forbid_dtd=True)
@@ -75,17 +89,34 @@ class IISLogsPlugin(plugin.Plugin):
                 log_format = log_file_element.get("logFormat") or "W3C"
                 if log_dir := log_file_element.get("directory"):
                     log_dir = self.target.resolve(log_dir)
-                    log_paths.append((log_format, log_dir))
+                    log_paths.add((log_format, log_dir))
 
         except (ElementTree.ParseError, DissectFileNotFoundError) as e:
-            self.target.log.warning(f"Error while parsing {self.config}: {e}")
+            self.target.log.warning("Error while parsing %s:%s", self.config, e)
 
-        return log_paths
+        for log_path in self.DEFAULT_LOG_PATHS:
+            try:
+                # later on we use */*.log to collect the files, so we need to move up 2 levels
+                log_dir = self.target.fs.path(log_path).parents[1]
+            except IndexError:
+                self.target.log.error("Incompatible path found: %s", log_path)
+                continue
+
+            if not has_glob_magic(str(log_dir)) and log_dir.exists():
+                log_paths.add(("auto", log_dir))
+                continue
+
+            for _log_dir_str in self.target.fs.glob(str(log_dir)):
+                if not (_log_dir := self.target.fs.path(_log_dir_str)).is_dir():
+                    continue
+                log_paths.add(("auto", _log_dir))
+
+        return list(log_paths)
 
     @plugin.internal
     def iter_log_format_path_pairs(self) -> list[tuple[str, str]]:
-        for log_format, log_dir_path in self.get_log_dirs():
-            for log_file in self.iter_log_paths(log_dir_path):
+        for log_format, log_dir_path in self.log_dirs:
+            for log_file in log_dir_path.glob("*/*.log"):
                 yield (log_format, log_file)
 
     @plugin.internal
@@ -155,7 +186,6 @@ class IISLogsPlugin(plugin.Plugin):
             row = replace_dash_with_none(row)
             yield BasicRecordDescriptor(**row)
 
-    @lru_cache(maxsize=4096)
     def _create_extended_descriptor(self, extra_fields: tuple[tuple[str, str]]) -> TargetRecordDescriptor:
         return TargetRecordDescriptor(LOG_RECORD_NAME, BASIC_RECORD_FIELDS + list(extra_fields))
 
@@ -270,11 +300,6 @@ class IISLogsPlugin(plugin.Plugin):
                 _target=self.target,
                 **{normalise_field_name(field): raw.get(field) for field in extra_fields},
             )
-
-    @plugin.internal
-    def iter_log_paths(self, log_dir: str) -> Iterator[Path]:
-        log_dir = fsutil.normalize(log_dir, alt_separator=self.target.fs.alt_separator)
-        yield from self.target.fs.path(log_dir).glob("*/*.log")
 
     @plugin.export(record=BasicRecordDescriptor)
     def logs(self) -> Iterator[TargetRecordDescriptor]:

@@ -2,7 +2,10 @@ import argparse
 import logging
 from typing import Union
 
+from dissect.util.feature import Feature, feature_enabled
+
 from dissect.target import Target, filesystem
+from dissect.target.exceptions import TargetError
 from dissect.target.helpers.utils import parse_options_string
 from dissect.target.tools.utils import (
     catch_sigpipe,
@@ -10,14 +13,30 @@ from dissect.target.tools.utils import (
     process_generic_arguments,
 )
 
+# Setting logging level to info for startup information.
+logging.basicConfig(level=logging.INFO)
+
 try:
-    from fuse import FUSE
+    if feature_enabled(Feature.BETA):
+        from fuse3 import FUSE3 as FUSE
+        from fuse3 import util
+
+        FUSE_VERSION = "3"
+        FUSE_LIB_PATH = util.libfuse._name
+    else:
+        from fuse import FUSE, _libfuse
+
+        FUSE_VERSION = "2"
+        FUSE_LIB_PATH = _libfuse._name
+
+    logging.info("Using fuse%s library: %s", FUSE_VERSION, FUSE_LIB_PATH)
 
     from dissect.target.helpers.mount import DissectMount
 
     HAS_FUSE = True
 except Exception:
     HAS_FUSE = False
+
 
 log = logging.getLogger(__name__)
 logging.lastResort = None
@@ -44,7 +63,13 @@ def main():
     if not HAS_FUSE:
         parser.exit("fusepy is not installed: pip install fusepy")
 
-    t = Target.open(args.target)
+    try:
+        t = Target.open(args.target)
+    except TargetError as e:
+        log.error(e)
+        log.debug("", exc_info=e)
+        parser.exit(1)
+
     vfs = filesystem.VirtualFilesystem()
     vfs.mount("fs", t.fs)
 
@@ -74,18 +99,28 @@ def main():
     options = parse_options_string(args.options) if args.options else {}
 
     options["nothreads"] = True
-    options["allow_other"] = True
     options["ro"] = True
+    # Check if the allow other option is either not set (None) or set to True with -o allow_other=True
+    if (allow_other := options.get("allow_other")) is None or str(allow_other).lower() == "true":
+        options["allow_other"] = True
+        # If allow_other was not set, warn the user that it will be set by default
+        if allow_other is None:
+            log.warning("Using option 'allow_other' by default, please use '-o allow_other=False' to unset")
+    # Let the user be able to unset the allow_other option by supplying -o allow_other=False
+    elif str(allow_other).lower() == "false":
+        options["allow_other"] = False
 
-    print(f"Mounting to {args.mount} with options: {_format_options(options)}")
+    log.info("Mounting to %s with options: %s", args.mount, _format_options(options))
     try:
         FUSE(DissectMount(vfs), args.mount, **options)
-    except RuntimeError:
-        parser.exit("FUSE error")
+    except RuntimeError as e:
+        log.error("Mounting target %s failed", t)
+        log.debug("", exc_info=e)
+        parser.exit(1)
 
 
 def _format_options(options: dict[str, Union[str, bool]]) -> str:
-    return ",".join([key if value is True else f"{key}={value}" for key, value in options.items()])
+    return ",".join(key if value is True else f"{key}={value}" for key, value in options.items())
 
 
 if __name__ == "__main__":

@@ -3,13 +3,14 @@ from collections import namedtuple
 from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Dict, Tuple
 
-from dissect import cstruct
+from dissect.cstruct import cstruct
 
 from dissect.target.exceptions import (
     RegistryError,
     RegistryValueNotFoundError,
     UnsupportedPluginError,
 )
+from dissect.target.helpers.mui import MUI_TZ_MAP
 from dissect.target.helpers.regutil import RegistryKey
 from dissect.target.plugin import Plugin, internal
 
@@ -33,8 +34,7 @@ typedef struct _REG_TZI_FORMAT {
     SYSTEMTIME DaylightDate;
 } REG_TZI_FORMAT;
 """
-c_tz = cstruct.cstruct()
-c_tz.load(tz_def)
+c_tz = cstruct().load(tz_def)
 
 
 # Althoug calendar.SUNDAY is only officially documented since Python 3.10, it
@@ -62,7 +62,7 @@ ZERO = timedelta(0)
 HOUR = timedelta(hours=1)
 
 
-def parse_systemtime_transition(systemtime: cstruct.Instance, year: int) -> datetime:
+def parse_systemtime_transition(systemtime: c_tz._SYSTEMTIME, year: int) -> datetime:
     """Return the transition datetime for a given year using the SYSTEMTIME of a STD or DST transition date.
 
     The SYSTEMTIME date of a TZI structure needs to be used to calculate the actual date for a given year.
@@ -137,9 +137,9 @@ class WindowsTimezone(tzinfo):
 
     def __init__(self, name: str, key: RegistryKey):
         self.name = name
-        self.display = key.value("Display").value
-        self.dlt_name = key.value("Dlt").value
-        self.std_name = key.value("Std").value
+        self.display = translate_tz(key, "Display")
+        self.dlt_name = translate_tz(key, "Dlt")
+        self.std_name = translate_tz(key, "Std")
         self.tzi = parse_tzi(key.value("TZI").value)
         self.dynamic_dst = parse_dynamic_dst(key)
 
@@ -250,3 +250,19 @@ class DateTimePlugin(Plugin):
         UTC datetime object.
         """
         return self.local(dt).astimezone(timezone.utc)
+
+
+def translate_tz(key: RegistryKey, name: str) -> str:
+    """Translate a timezone resource string to English.
+
+    Non-English distributions of Windows contain a local translation in the "Display", "Dlt" and "Std" keys.
+    The ``MUI_*`` keys contain a reference to the English timezone name we want, e.g. "@tzres.dll,-1337".
+    """
+    try:
+        string_id = int(key.value("MUI_" + name).value.replace("@tzres.dll,-", ""))
+        if translation := MUI_TZ_MAP.get(string_id):
+            return translation
+    except (RegistryValueNotFoundError, ValueError):
+        pass
+
+    return key.value(name).value

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import zipfile
+from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from dissect.target.filesystem import LayerFilesystem
 from dissect.target.filesystems.dir import DirectoryFilesystem
 from dissect.target.filesystems.zip import ZipFilesystem
 from dissect.target.helpers import loaderutil
@@ -34,13 +36,23 @@ def find_entry_path(path: Path) -> str | None:
             return prefix
 
 
-def map_dirs(target: Target, dirs: list[Path], os_type: str, **kwargs) -> None:
+def map_dirs(
+    target: Target,
+    dirs: list[Path | tuple[str, Path]],
+    os_type: str,
+    *,
+    dirfs: type[DirectoryFilesystem] = DirectoryFilesystem,
+    zipfs: type[ZipFilesystem] = ZipFilesystem,
+    **kwargs,
+) -> None:
     """Map directories as filesystems into the given target.
 
     Args:
         target: The target to map into.
-        dirs: The directories to map as filesystems.
+        dirs: The directories to map as filesystems. If a list member is a tuple, the first element is the drive letter.
         os_type: The operating system type, used to determine how the filesystem should be mounted.
+        dirfs: The filesystem class to use for directory filesystems.
+        zipfs: The filesystem class to use for ZIP filesystems.
     """
     alt_separator = ""
     case_sensitive = True
@@ -48,18 +60,40 @@ def map_dirs(target: Target, dirs: list[Path], os_type: str, **kwargs) -> None:
         alt_separator = "\\"
         case_sensitive = False
 
+    drive_letter_map = defaultdict(list)
     for path in dirs:
+        drive_letter = None
+        if isinstance(path, tuple):
+            drive_letter, path = path
+        elif is_drive_letter_path(path):
+            drive_letter = path.name[0]
+
         if isinstance(path, zipfile.Path):
-            dfs = ZipFilesystem(path.root.fp, path.at, alt_separator=alt_separator, case_sensitive=case_sensitive)
+            dfs = zipfs(path.root.fp, path.at, alt_separator=alt_separator, case_sensitive=case_sensitive)
         else:
-            dfs = DirectoryFilesystem(path, alt_separator=alt_separator, case_sensitive=case_sensitive)
-        target.filesystems.add(dfs)
+            dfs = dirfs(path, alt_separator=alt_separator, case_sensitive=case_sensitive)
 
+        drive_letter_map[drive_letter].append(dfs)
+
+    fs_to_add = []
+    for drive_letter, dfs in drive_letter_map.items():
+        if drive_letter is not None:
+            if len(dfs) > 1:
+                vfs = LayerFilesystem()
+                for fs in dfs:
+                    vfs.append_fs_layer(fs)
+            else:
+                vfs = dfs[0]
+
+            fs_to_add.append(vfs)
+            target.fs.mount(drive_letter.lower() + ":", vfs)
+        else:
+            fs_to_add.extend(dfs)
+
+    for fs in fs_to_add:
+        target.filesystems.add(fs)
         if os_type == OperatingSystem.WINDOWS:
-            loaderutil.add_virtual_ntfs_filesystem(target, dfs, **kwargs)
-
-            if is_drive_letter_path(path):
-                target.fs.mount(path.name[0] + ":", dfs)
+            loaderutil.add_virtual_ntfs_filesystem(target, fs, **kwargs)
 
 
 def find_and_map_dirs(target: Target, path: Path, **kwargs) -> None:

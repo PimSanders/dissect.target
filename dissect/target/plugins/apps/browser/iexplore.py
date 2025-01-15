@@ -26,7 +26,7 @@ class WebCache:
         self.target = target
         self.db = esedb.EseDB(fh)
 
-    def find_containers(self, name: str) -> table.Table:
+    def find_containers(self, name: str) -> Iterator[table.Table]:
         """Look up all ``ContainerId`` values for a given container name.
 
         Args:
@@ -36,14 +36,18 @@ class WebCache:
             All ``ContainerId`` values for the requested container name.
         """
         try:
-            for container_record in self.db.table("Containers").records():
+            table = self.db.table("Containers")
+
+            for container_record in table.records():
                 if record_name := container_record.get("Name"):
                     record_name = record_name.rstrip("\00").lower()
                     if record_name == name.lower():
                         container_id = container_record.get("ContainerId")
                         yield self.db.table(f"Container_{container_id}")
-        except KeyError:
-            pass
+
+        except KeyError as e:
+            self.target.log.warning("Exception while parsing EseDB Containers table")
+            self.target.log.debug("", exc_info=e)
 
     def _iter_records(self, name: str) -> Iterator[record.Record]:
         """Yield records from a Webcache container.
@@ -69,6 +73,9 @@ class WebCache:
         """Yield records from the iedownload webcache container."""
         yield from self._iter_records("iedownload")
 
+    def cookies(self) -> None:
+        raise NotImplementedError("Cookies plugin is not implemented for Internet Explorer yet")
+
 
 class InternetExplorerPlugin(BrowserPlugin):
     """Internet explorer browser plugin."""
@@ -78,12 +85,15 @@ class InternetExplorerPlugin(BrowserPlugin):
     DIRS = [
         "AppData/Local/Microsoft/Windows/WebCache",
     ]
+
     CACHE_FILENAME = "WebCacheV01.dat"
-    BrowserDownloadRecord = create_extended_descriptor([UserRecordDescriptorExtension])(
-        "browser/ie/download", GENERIC_DOWNLOAD_RECORD_FIELDS
-    )
+
     BrowserHistoryRecord = create_extended_descriptor([UserRecordDescriptorExtension])(
         "browser/ie/history", GENERIC_HISTORY_RECORD_FIELDS
+    )
+
+    BrowserDownloadRecord = create_extended_descriptor([UserRecordDescriptorExtension])(
+        "browser/ie/download", GENERIC_DOWNLOAD_RECORD_FIELDS
     )
 
     def __init__(self, target: Target):
@@ -125,8 +135,9 @@ class InternetExplorerPlugin(BrowserPlugin):
         """Return browser history records from Internet Explorer.
 
         Yields BrowserHistoryRecord with the following fields:
-            hostname (string): The target hostname.
-            domain (string): The target domain.
+
+        .. code-block:: text
+
             ts (datetime): Visit timestamp.
             browser (string): The browser from which the records are generated from.
             id (string): Record ID.
@@ -179,8 +190,9 @@ class InternetExplorerPlugin(BrowserPlugin):
         """Return browser downloads records from Internet Explorer.
 
         Yields BrowserDownloadRecord with the following fields:
-            hostname (string): The target hostname.
-            domain (string): The target domain.
+
+        .. code-block:: text
+
             ts_start (datetime): Download start timestamp.
             ts_end (datetime): Download end timestamp.
             browser (string): The browser from which the records are generated from.
@@ -210,7 +222,7 @@ class InternetExplorerPlugin(BrowserPlugin):
                     ts_end=ts_end,
                     browser="iexplore",
                     id=container_record.EntryId,
-                    path=down_path,
+                    path=self.target.fs.path(down_path) if down_path else None,
                     url=down_url,
                     size=None,
                     state=None,

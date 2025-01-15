@@ -1,16 +1,54 @@
 from __future__ import annotations
 
 import io
+import json
+import logging
 import re
+import sys
 from collections import deque
 from configparser import ConfigParser, MissingSectionHeaderError
 from dataclasses import dataclass
 from fnmatch import fnmatch
-from typing import Any, ItemsView, Iterator, KeysView, Optional, TextIO, Union
+from types import TracebackType
+from typing import (
+    Any,
+    Callable,
+    ItemsView,
+    Iterable,
+    Iterator,
+    KeysView,
+    Literal,
+    Optional,
+    TextIO,
+    Union,
+)
+
+from defusedxml import ElementTree
 
 from dissect.target.exceptions import ConfigurationParsingError, FileNotFoundError
 from dissect.target.filesystem import FilesystemEntry
 from dissect.target.helpers.fsutil import TargetPath
+
+try:
+    from ruamel.yaml import YAML
+
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
+
+try:
+    if sys.version_info < (3, 11):
+        import tomli as toml
+    else:
+        # tomllib is included since python 3.11
+        import tomllib as toml  # novermin
+
+    HAS_TOML = True
+except ImportError:
+    HAS_TOML = False
+
+
+log = logging.getLogger(__name__)
 
 
 def _update_dictionary(current: dict[str, Any], key: str, value: Any) -> None:
@@ -31,9 +69,7 @@ def _update_dictionary(current: dict[str, Any], key: str, value: Any) -> None:
 
 
 class PeekableIterator:
-    """Source gotten from:
-    https://more-itertools.readthedocs.io/en/stable/_modules/more_itertools/more.html#peekable
-    """
+    # https://more-itertools.readthedocs.io/en/stable/_modules/more_itertools/more.html#peekable
 
     def __init__(self, iterable):
         self._iterator = iter(iterable)
@@ -58,18 +94,29 @@ class PeekableIterator:
 
 
 class ConfigurationParser:
+    """A configuration parser where you can configure certain aspects of the parsing mechanism.
+
+    Args:
+        collapse: A ``bool`` or an ``Iterator``:
+          If ``True``: it will collapse all the resulting dictionary values.
+          If an ``Iterable`` it will collapse on the keys defined in ``collapse``.
+        collapse_inverse: Inverses the collapsing mechanism. Collapse on everything that is not inside ``collapse``.
+        separator: Contains what values it should look for as a separator.
+        comment_prefixes: Contains what constitutes as a comment.
+    """
+
     def __init__(
         self,
-        collapse: Union[bool, set] = False,
+        collapse: Union[bool, Iterable[str]] = False,
         collapse_inverse: bool = False,
-        seperator: tuple[str] = ("=",),
+        separator: tuple[str] = ("=",),
         comment_prefixes: tuple[str] = (";", "#"),
     ) -> None:
         self.collapse_all = collapse is True
-        self.collapse = collapse if isinstance(collapse, set) else set()
+        self.collapse = set(collapse) if isinstance(collapse, Iterable) else set()
         self._collapse_check = self._key_not_in_collapse if collapse_inverse else self._key_in_collapse
 
-        self.seperator = seperator
+        self.separator = separator
         self.comment_prefixes = comment_prefixes
         self.parsed_data = {}
 
@@ -101,25 +148,35 @@ class ConfigurationParser:
         return key not in self.collapse
 
     def parse_file(self, fh: TextIO) -> None:
+        """Parse the contents of ``fh`` into key/value pairs.
+
+        This function should **set** :attr:`parsed_data` as a side_effect.
+
+        Args:
+            fh: The text to parse.
+        """
         raise NotImplementedError()
 
     def get(self, item: str, default: Optional[Any] = None) -> Any:
         return self.parsed_data.get(item, default)
 
-    def read_file(self, fh: TextIO) -> None:
+    def read_file(self, fh: TextIO | io.BytesIO) -> None:
         """Parse a configuration file.
 
         Raises:
-            ConfigurationParsingError: If any exception occurs during during the parsing process
+            ConfigurationParsingError: If any exception occurs during during the parsing process.
         """
 
         try:
             self.parse_file(fh)
         except Exception as e:
-            raise ConfigurationParsingError from e
+            raise ConfigurationParsingError(e.args) from e
 
         if self.collapse_all or self.collapse:
             self.parsed_data = self._collapse_dict(self.parsed_data)
+
+        if not isinstance(self.parsed_data, dict):
+            self.parsed_data = self._collapse_dict(self.parsed_data, False)
 
     def keys(self) -> KeysView:
         return self.parsed_data.keys()
@@ -129,19 +186,21 @@ class ConfigurationParser:
 
 
 class Default(ConfigurationParser):
-    """Parse a configuration file specified by ``seperator`` and ``comment_prefixes``.
+    """Parse a configuration file specified by ``separator`` and ``comment_prefixes``.
 
-    This parser splits only on the first ``seperator`` it finds:
+    This parser splits only on the first ``separator`` it finds:
 
-        key<seperator>value     -> {"key": "value"}
+    .. code-block::
 
-        key<seperator>value\n
+        key<separator>value     -> {"key": "value"}
+
+        key<separator>value\n
           continuation
                                 -> {"key": "value continuation"}
 
         # Unless we collapse values, we add them to a list to not overwrite any values.
-        key<seperator>value1
-        key<seperator>value2
+        key<separator>value1
+        key<separator>value2
                                 -> {key: [value1, value2]}
 
         <empty_space><comment>  -> skip
@@ -149,17 +208,18 @@ class Default(ConfigurationParser):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.SEPERATOR = re.compile(rf"\s*[{''.join(self.seperator)}]\s*")
+        self.SEPARATOR = re.compile(rf"\s*[{''.join(self.separator)}]\s*")
         self.COMMENTS = re.compile(rf"\s*[{''.join(self.comment_prefixes)}]")
         self.skip_lines = self.comment_prefixes + ("\n",)
 
-    def line_reader(self, fh: TextIO) -> Iterator[str]:
+    def line_reader(self, fh: TextIO, strip_comments: bool = True) -> Iterator[str]:
         for line in fh:
             if line.strip().startswith(self.skip_lines) or not line.strip():
                 continue
 
-            # Strip the comments first
-            line, *_ = self.COMMENTS.split(line, 1)
+            if strip_comments:
+                line, *_ = self.COMMENTS.split(line, 1)
+
             yield line
 
     def parse_file(self, fh: TextIO) -> None:
@@ -173,10 +233,37 @@ class Default(ConfigurationParser):
                 information_dict[prev_key] = " ".join([prev_value, line.strip()])
                 continue
 
-            prev_key, *value = self.SEPERATOR.split(line, 1)
+            prev_key, *value = self.SEPARATOR.split(line, 1)
             value = value[0].strip() if value else ""
 
             _update_dictionary(information_dict, prev_key, value)
+
+        self.parsed_data = information_dict
+
+
+class CSVish(Default):
+    """Parses CSV-ish config files (does not confirm to CSV standard!)"""
+
+    def __init__(self, *args, fields: tuple[str], **kwargs) -> None:
+        self.fields = fields
+        self.num_fields = len(self.fields)
+        self.maxsplit = self.num_fields - 1
+        super().__init__(*args, **kwargs)
+
+    def parse_file(self, fh: TextIO) -> None:
+        information_dict = {}
+
+        for i, raw_line in enumerate(self.line_reader(fh, strip_comments=True)):
+            line = raw_line.strip()
+            columns = re.split(self.SEPARATOR, line, maxsplit=self.maxsplit)
+
+            if len(columns) < self.num_fields:
+                # keep unparsed lines separate (often env vars)
+                data = {"line": line}
+            else:
+                data = dict(zip(self.fields, columns))
+
+            information_dict[str(i)] = data
 
         self.parsed_data = information_dict
 
@@ -189,7 +276,7 @@ class Ini(ConfigurationParser):
 
         self.parsed_data = ConfigParser(
             strict=False,
-            delimiters=self.seperator,
+            delimiters=self.separator,
             comment_prefixes=self.comment_prefixes,
             allow_no_value=True,
             interpolation=None,
@@ -217,93 +304,491 @@ class Txt(ConfigurationParser):
         self.parsed_data = {"content": fh.read(), "size": str(fh.tell())}
 
 
-class Indentation(Default):
-    """This parser is used for the files that use a single level of indentation to specify a different scope.
+class Bin(ConfigurationParser):
 
-    Examples of these files are for example the sshd_config file.
-    Where "Match" statments use a single layer of indentaiton to specify a scope for the key value pairs.
+    """Read the file into ``binary`` and show the number of bytes read"""
+
+    def parse_file(self, fh: io.BytesIO) -> None:
+        self.parsed_data = {"binary": fh.read(), "size": str(fh.tell())}
+
+
+class Xml(ConfigurationParser):
+    """Parses an XML file. Ignores any constructor parameters passed from ``ConfigurationParser``."""
+
+    def _tree(self, tree: ElementTree, root: bool = False) -> dict:
+        """Very simple but robust xml -> dict implementation, see comments."""
+        nodes = {}
+        result = {}
+        counter = {}
+
+        # each node is a folder (so the structure is always the same! [1])
+        for node in tree.findall("*"):
+            # if a node contains multiple nodes with the same name, number them
+            if node.tag in counter:
+                counter[node.tag] += 1
+                nodes[f"{node.tag}-{counter[node.tag]}"] = self._tree(node)
+            else:
+                counter[node.tag] = 1
+                nodes[node.tag] = self._tree(node)
+
+        # all attribs go in the attribute folder
+        # (i.e. stable, does not change depending on xml structure! [2]
+        # Also, this way we "know" they have been attributes, i.e. we don't lose information! [3]
+        if tree.attrib:
+            result["attributes"] = tree.attrib
+
+        # all subnodes go in the nodes folder
+        if nodes:
+            result["nodes"] = nodes
+
+        # content goes into the text folder
+        # we don't use special prefixes ($) because XML docs may use them anyway (even though they are forbidden)
+        if tree.text:
+            if text := tree.text.strip(" \n\r"):
+                result["text"] = text
+
+        # if you need to store meta-data, you can extend add more entries here... CDATA, Comments, errors
+        result = {tree.tag: result} if root else result
+        return result
+
+    def _fix(self, content: str, position: tuple(int, int)) -> str:
+        """Quick heuristic fix. If there is an invalid token, just remove it."""
+        lineno, offset = position
+        lines = content.split("\n")
+
+        line = lines[lineno - 1]
+        line = line[: offset - 1] + "" + line[offset + 1 :]
+
+        lines[lineno - 1] = line
+
+        return "\n".join(lines)
+
+    def parse_file(self, fh: TextIO) -> None:
+        content = fh.read()
+        document = content
+        errors = 0
+        limit = 20
+        tree = {}
+
+        while not tree and errors < limit:
+            try:
+                tree = self._tree(ElementTree.fromstring(document), root=True)
+                break
+            except ElementTree.ParseError as err:
+                errors += 1
+                document = self._fix(document, err.position)
+
+        if not tree:
+            # Error limit reached. Thus we consider the document not parseable.
+            raise ConfigurationParsingError(f"Could not parse XML file: {fh.name} after {errors} attempts.")
+
+        self.parsed_data = tree
+
+
+class ListUnwrapper:
+    """Provides utility functions to unwrap dictionary objects out of lists."""
+
+    @staticmethod
+    def unwrap(data: Union[dict, list]) -> Union[dict, list]:
+        """Transforms a list with dictionaries to a dictionary.
+
+        The order of the list is preserved. If no dictionary is found, the list remains untouched:
+
+        .. code-block::
+
+            ["value1", "value2"]    -> ["value1", "value2"]
+
+            {"data": "value"}       -> {"data": "value"}
+
+            [{"data": "value"}]     -> {
+                                           "list_item0": {
+                                                "data": "value"
+                                           }
+                                       }
+        """
+        orig = ListUnwrapper._unwrap_dict_list(data)
+        return ListUnwrapper._unwrap_dict(orig)
+
+    @staticmethod
+    def _unwrap_dict(data: Union[dict, list]) -> Union[dict, list]:
+        """Looks for dictionaries and unwraps its values."""
+
+        if not isinstance(data, dict):
+            return data
+
+        root = dict()
+        for key, value in data.items():
+            _value = ListUnwrapper._unwrap_dict_list(value)
+            if isinstance(_value, dict):
+                _value = ListUnwrapper._unwrap_dict(_value)
+            root[key] = _value
+
+        return root
+
+    @staticmethod
+    def _unwrap_dict_list(data: Union[dict, list]) -> Union[dict, list]:
+        """Unwraps a list containing dictionaries."""
+        if not isinstance(data, list) or not any(isinstance(obj, dict) for obj in data):
+            return data
+
+        return_value = {}
+        for idx, elem in enumerate(data):
+            return_value[f"list_item{idx}"] = elem
+
+        return return_value
+
+
+class Json(ConfigurationParser):
+    """Parses a JSON file."""
+
+    def parse_file(self, fh: TextIO):
+        parsed_data = json.load(fh)
+        self.parsed_data = ListUnwrapper.unwrap(parsed_data)
+
+
+class Yaml(ConfigurationParser):
+    """Parses a Yaml file."""
+
+    def parse_file(self, fh: TextIO) -> None:
+        if HAS_YAML:
+            parsed_data = YAML(typ="safe").load(fh)
+            self.parsed_data = ListUnwrapper.unwrap(parsed_data)
+        else:
+            raise ConfigurationParsingError("Failed to parse file, please install ruamel.yaml.")
+
+
+class Toml(ConfigurationParser):
+    """Parses a Toml file."""
+
+    def parse_file(self, fh: TextIO) -> None:
+        if HAS_TOML:
+            self.parsed_data = toml.loads(fh.read())
+        else:
+            raise ConfigurationParsingError("Failed to parse file, please install tomli.")
+
+
+class Env(ConfigurationParser):
+    """Parses ``.env`` file contents according to Docker and bash specification.
+
+    Does not apply interpolation of substituted values, e.g. ``foo=${bar}`` and does not attempt to parse list or dict
+    strings. Does not support dynamic env files, e.g. ``foo=`bar```. Also does not support multi-line key/value
+    assignments (yet).
+
+    Resources:
+        - https://docs.docker.com/compose/environment-variables/variable-interpolation/#env-file-syntax
+        - https://github.com/theskumar/python-dotenv/blob/main/src/dotenv/parser.py
+    """
+
+    RE_KV = re.compile(r"^(?P<key>.+?)=(?P<value>(\".+?\")|(\'.+?\')|(.*?))?(?P<comment> \#.+?)?$")
+
+    def __init__(self, comments: bool = True, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.comments = comments
+        self.parsed_data: dict | tuple[dict, str | None] = {}
+
+    def parse_file(self, fh: TextIO) -> None:
+        for line in fh.readlines():
+            # Blank lines are ignored.
+            # Lines beginning with ``#`` are processed as comments and ignored.
+            if not line or line[0] == "#" or "=" not in line:
+                continue
+
+            # Each line represents a key-value pair. Values can optionally be quoted.
+            # Inline comments for unquoted values must be preceded with a space.
+            # Value may be empty.
+            match = self.RE_KV.match(line)
+
+            # Line could be invalid
+            if not match:
+                log.warning("Could not parse line in %s: '%s'", fh, line)
+                continue
+
+            key = match.groupdict()["key"]
+            value = match.groupdict().get("value") or ""
+            value = value.strip()
+            comment = match.groupdict().get("comment")
+            comment = comment.replace(" # ", "", 1) if comment else None
+
+            # Surrounding whitespace characters are removed, unless quoted.
+            if value and ((value[0] == '"' and value[-1] == '"') or (value[0] == "'" and value[-1] == "'")):
+                is_quoted = True
+                value = value.strip("\"'")
+            else:
+                is_quoted = False
+                value = value.strip()
+
+            # Unquoted values may start with a quote if they are properly escaped.
+            if not is_quoted and value[:2] in ["\\'", '\\"']:
+                value = value[1:]
+
+            # Interpret boolean values
+            if value.lower() in ["1", "true"]:
+                value = True
+            elif value.lower() in ["0", "false"]:
+                value = False
+
+            # Interpret integer values
+            if isinstance(value, str) and re.match(r"^[0-9]{1,}$", value):
+                value = int(value)
+
+            if key.strip() in self.parsed_data:
+                log.warning("Duplicate environment key '%s' in file %s", key.strip(), fh)
+
+            self.parsed_data[key.strip()] = (value, comment) if self.comments else value
+
+
+class ScopeManager:
+    """A (context)manager for dictionary scoping.
+
+    This class provides utility functions to keep track of scopes inside a dictionary.
+
+    Attributes:
+        _parents: A dictionary accounting what child belongs to which parent dictionary.
+        _root: The initial dictionary.
+        _current: The current dictionary.
+        _previous: The node before the current (changed) node.
+    """
+
+    def __init__(self) -> None:
+        self._parents = {}
+        self._root = {}
+        self._current = self._root
+        self._previous = None
+
+    def __enter__(self) -> ScopeManager:
+        return self
+
+    def __exit__(
+        self,
+        type: Optional[type[BaseException]],
+        value: Optional[BaseException],
+        traceback: Optional[TracebackType],
+    ) -> None:
+        self.clean()
+
+    def _set_prev(self, keep_prev: bool) -> None:
+        """Set :attr:`_previous` before :attr:`_current` changes."""
+        if not keep_prev:
+            self._previous = self._current
+
+    def push(self, name: str, keep_prev: bool = False) -> Literal[True]:
+        """Push a new key to the :attr:`_current` dictionary and return that we did."""
+        child = self._current.get(name, {})
+
+        parent = self._current
+        self._parents[id(child)] = parent
+        parent[name] = child
+        self._set_prev(keep_prev)
+        self._current = child
+        return True
+
+    def pop(self, keep_prev: bool = False) -> bool:
+        """Pop :attr:`_current` and return whether we changed the :attr:`_parents` dictionary."""
+        if new_current := self._parents.pop(id(self._current), None):
+            self._set_prev(keep_prev)
+            self._current = new_current
+            return True
+        return False
+
+    def update(self, key: str, value: str) -> None:
+        """Update the :attr:`_current` dictionary with ``key`` and ``value``."""
+        _update_dictionary(self._current, key, value)
+
+    def update_prev(self, key: str, value: str) -> None:
+        """Update the :attr:`_previous` dictionary with ``key`` and ``value``."""
+        _update_dictionary(self._previous, key, value)
+
+    def is_root(self) -> bool:
+        """Utility function to check whether the current dictionary is a root dictionary."""
+        return id(self._current) == id(self._root)
+
+    def clean(self) -> None:
+        """Clean up the internal state.
+        This is called automatically when :class:`ScopeManager` is used as a contextmanager.
+        """
+        self._parents = {}
+        self._root = {}
+        self._current = self._root
+        self._previous = None
+
+
+class Indentation(Default):
+    """This parser is used for files that use a single level of indentation to specify a different scope.
+
+    Examples of these files are the ``sshd_config`` file.
+    Where "Match" statements use a single layer of indentation to specify a scope for the key value pairs.
 
     The parser parses this as the following:
+
+    .. code-block::
 
       key value
         key2 value2
                        -> {"key value": {"key2": "value2"}}
     """
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self._parents = {}
-        self._indentation = 0
-
     def _parse_line(self, line: str) -> tuple[str, str]:
-        key, *value = self.SEPERATOR.split(line.strip(), 1)
+        key, *value = self.SEPARATOR.split(line.strip(), 1)
         value = value[0].strip() if value else ""
         return key, value
 
-    def _push_scope(self, name: str, current: dict[str, Union[str, dict]]) -> dict[str, Union[str, dict]]:
-        child = current.get(name, {})
+    def _change_scope(
+        self,
+        manager: ScopeManager,
+        line: str,
+        key: str,
+        next_line: Optional[str] = None,
+    ) -> bool:
+        """A function to check whether to create a new scope, or go back to a previous one.
 
-        parent = current
-        self._parents[id(child)] = parent
-        parent[name] = child
-        return child
+        Args:
+            manager: A :class:`ScopeManager` that contains the logic to ``push`` and ``pop`` scopes. And keeps state.
+            line: The line to be parsed.
+            key: The key that should be updated during a :method:`ScopeManager.push`.
+            next_line: The next line to be parsed.
 
-    def _pop_scope(self, current: dict[str, Union[str, dict]]) -> dict[str, Union[str, dict]]:
-        self._indentation = 0
-        return self._parents.pop(id(current), current)
+        Returns:
+            Whether the scope changed or not.
+        """
+        empty_space = (" ", "\t")
+        changed = False
+
+        if next_line is None:
+            return False
+
+        if not line.startswith(empty_space):
+            changed = manager.pop()
+
+        if not line.startswith(empty_space) and next_line.startswith(empty_space):
+            return manager.push(key)
+        return changed
+
+    def parse_file(self, fh: TextIO) -> None:
+        iterator = PeekableIterator(self.line_reader(fh))
+        prev_key = None
+
+        with ScopeManager() as manager:
+            for line in iterator:
+                key, value = self._parse_line(line)
+                changed = self._change_scope(
+                    manager=manager,
+                    line=line,
+                    key=line.strip(),
+                    next_line=iterator.peek(),
+                )
+
+                if changed:
+                    prev_key = line.strip()
+                    continue
+
+                if not value:
+                    key, value = prev_key, key
+                    manager.pop()
+
+                manager.update(key, value)
+
+            self.parsed_data = manager._root
+
+
+class SystemD(Indentation):
+    """A :class:`ConfigurationParser` that specifically parses systemd configuration files.
+
+    Examples:
+
+        .. code-block::
+
+            >>> systemd_data = textwrap.dedent(
+                    '''
+                    [Section1]
+                    Key=Value
+                    [Section2]
+                    Key2=Value 2\\
+                        Value 2 continued
+                    '''
+                )
+            >>> parser = SystemD(io.StringIO(systemd_data))
+            >>> parser.parser_items
+            {
+                "Section1": {
+                    "Key": "Value
+                },
+                "Section2": {
+                    "Key2": "Value2 Value 2 continued
+                }
+            }
+    """
 
     def _change_scope(
         self,
+        manager: ScopeManager,
         line: str,
-        next_line: Optional[str],
-        key: Optional[str],
-        current: dict[str, Union[str, dict]],
-    ) -> dict[str, Union[str, dict]]:
-        empty_space = (" ", "\t")
+        key: str,
+        next_line: Optional[str] = None,
+    ) -> bool:
+        scope_char = ("[", "]")
+        changed = False
+        if line.startswith(scope_char):
+            if not manager.is_root():
+                changed = manager.pop()
+            stripped_characters = "".join(scope_char)
+            changed = manager.push(key.strip(stripped_characters), changed)
 
-        if next_line is None:
-            return current
-
-        if not line.startswith(empty_space):
-            current = self._pop_scope(current)
-
-        if not line.startswith(empty_space) and next_line.startswith(empty_space):
-            self._indentation = len(next_line) - len(next_line.lstrip())
-            return self._push_scope(key, current)
-        return current
+        return changed
 
     def parse_file(self, fh: TextIO) -> None:
-        root = {}
-        current = root
-
-        iterator = PeekableIterator(self.line_reader(fh))
+        prev_values = []
         prev_key = None
-        for line in iterator:
-            key, value = self._parse_line(line)
-            prev_dict = current
-            current = self._change_scope(line, iterator.peek(), line.strip(), current)
 
-            if id(current) != id(prev_dict):
-                prev_key = line.strip()
-                continue
+        with ScopeManager() as manager:
+            for line in self.line_reader(fh, strip_comments=False):
+                changed = self._change_scope(
+                    manager=manager,
+                    line=line,
+                    key=line.strip(),
+                )
 
-            if not value:
-                key, value = prev_key, key
-                current = self._pop_scope(current)
+                if changed:
+                    # Current part is a section header.
+                    if prev_values:
+                        # Update previous key/value... someone configured it wrong
+                        prev_values, prev_key = self._update_continued_values(
+                            func=manager.update_prev,
+                            key=prev_key,
+                            values=prev_values,
+                        )
+                    continue
 
-            _update_dictionary(current, key, value)
+                key, value = self._parse_line(line)
 
-        self.parsed_data = root
-        # Cleanup of internal state
-        self._parents = {}
-        self._indentation = 0
+                continued_value = value or key
+                if continued_value.endswith("\\"):
+                    prev_key = prev_key or key
+                    prev_values.append(continued_value.strip("\\ "))
+                    continue
+
+                if prev_values:
+                    prev_values, prev_key = self._update_continued_values(
+                        func=manager.update,
+                        key=prev_key,
+                        values=prev_values + [continued_value],
+                    )
+                    continue
+
+                manager.update(key, value)
+
+            self.parsed_data = manager._root
+
+    def _update_continued_values(self, func: Callable, key, values: list[str]) -> tuple[list, None]:
+        value = " ".join(values)
+        func(key, value)
+        return [], None
 
 
 @dataclass(frozen=True)
 class ParserOptions:
     collapse: Optional[Union[bool, set]] = None
     collapse_inverse: Optional[bool] = None
-    seperator: Optional[tuple[str]] = None
+    separator: Optional[tuple[str]] = None
     comment_prefixes: Optional[tuple[str]] = None
 
 
@@ -312,13 +797,14 @@ class ParserConfig:
     parser: type[ConfigurationParser] = Default
     collapse: Optional[Union[bool, set]] = None
     collapse_inverse: Optional[bool] = None
-    seperator: Optional[tuple[str]] = None
+    separator: Optional[tuple[str]] = None
     comment_prefixes: Optional[tuple[str]] = None
+    fields: Optional[tuple[str]] = None
 
     def create_parser(self, options: Optional[ParserOptions] = None) -> ConfigurationParser:
         kwargs = {}
 
-        for field_name in ["collapse", "collapse_inverse", "seperator", "comment_prefixes"]:
+        for field_name in ["collapse", "collapse_inverse", "separator", "comment_prefixes", "fields"]:
             value = getattr(options, field_name, None) or getattr(self, field_name)
             if value:
                 kwargs.update({field_name: value})
@@ -327,52 +813,105 @@ class ParserConfig:
 
 
 MATCH_MAP: dict[str, ParserConfig] = {
-    "*/systemd/*": ParserConfig(Ini),
+    "*/systemd/*": ParserConfig(SystemD),
     "*/sysconfig/network-scripts/ifcfg-*": ParserConfig(Default),
     "*/sysctl.d/*.conf": ParserConfig(Default),
+    "*/xml/*": ParserConfig(Xml),
+    "*.bashrc": ParserConfig(Txt),
+    "*/vim/vimrc*": ParserConfig(Txt),
 }
-
 
 CONFIG_MAP: dict[tuple[str, ...], ParserConfig] = {
     "ini": ParserConfig(Ini),
-    "xml": ParserConfig(Txt),
-    "json": ParserConfig(Txt),
+    "xml": ParserConfig(Xml),
+    "json": ParserConfig(Json),
+    "yml": ParserConfig(Yaml),
+    "yaml": ParserConfig(Yaml),
     "cnf": ParserConfig(Default),
-    "conf": ParserConfig(Default, seperator=(r"\s")),
+    "conf": ParserConfig(Default, separator=(r"\s",)),
     "sample": ParserConfig(Txt),
+    "sh": ParserConfig(Txt),
+    "key": ParserConfig(Txt),
+    "crt": ParserConfig(Txt),
+    "pem": ParserConfig(Txt),
+    "pl": ParserConfig(Txt),  # various admin panels
+    "lua": ParserConfig(Txt),  # wireshark etc.
+    "txt": ParserConfig(Txt),
+    "systemd": ParserConfig(SystemD),
     "template": ParserConfig(Txt),
+    "toml": ParserConfig(Toml),
 }
+
+
 KNOWN_FILES: dict[str, type[ConfigurationParser]] = {
     "ulogd.conf": ParserConfig(Ini),
-    "sshd_config": ParserConfig(Indentation, seperator=(r"\s",)),
-    "hosts.allow": ParserConfig(Default, seperator=(":",), comment_prefixes=("#",)),
-    "hosts.deny": ParserConfig(Default, seperator=(":",), comment_prefixes=("#",)),
-    "hosts": ParserConfig(Default, seperator=(r"\s")),
-    "nsswitch.conf": ParserConfig(Default, seperator=(":",)),
+    "sshd_config": ParserConfig(Indentation, separator=(r"\s",)),
+    "hosts.allow": ParserConfig(Default, separator=(":",), comment_prefixes=("#",)),
+    "hosts.deny": ParserConfig(Default, separator=(":",), comment_prefixes=("#",)),
+    "hosts": ParserConfig(Default, separator=(r"\s",)),
+    "nsswitch.conf": ParserConfig(Default, separator=(":",)),
     "lsb-release": ParserConfig(Default),
+    "catalog": ParserConfig(Xml),
+    "ld.so.cache": ParserConfig(Bin),
+    "fstab": ParserConfig(
+        CSVish,
+        separator=(r"\s",),
+        comment_prefixes=("#",),
+        fields=("device", "mount", "type", "options", "dump", "pass"),
+    ),
+    "crontab": ParserConfig(
+        CSVish,
+        separator=(r"\s",),
+        comment_prefixes=("#",),
+        fields=("minute", "hour", "day", "month", "weekday", "user", "command"),
+    ),
+    "shadow": ParserConfig(
+        CSVish,
+        separator=(r"\:",),
+        comment_prefixes=("#",),
+        fields=(
+            "username",
+            "password",
+            "lastchange",
+            "minpassage",
+            "maxpassage",
+            "warning",
+            "inactive",
+            "expire",
+            "rest",
+        ),
+    ),
+    "passwd": ParserConfig(
+        CSVish,
+        separator=(r"\:",),
+        comment_prefixes=("#",),
+        fields=("username", "password", "uid", "gid", "gecos", "homedir", "shell"),
+    ),
+    "mime.types": ParserConfig(CSVish, separator=(r"\s+",), comment_prefixes=("#",), fields=("name", "extensions")),
 }
 
 
-def parse(path: Union[FilesystemEntry, TargetPath], hint: Optional[str] = None, *args, **kwargs) -> ConfigParser:
+def parse(path: Union[FilesystemEntry, TargetPath], hint: Optional[str] = None, *args, **kwargs) -> ConfigurationParser:
     """Parses the content of an ``path`` or ``entry`` to a dictionary.
 
     Args:
-        file_path: An entry or targetpath that with contents to parse
-        hint: A hint to what parser should be used.
-        collapse:
-        seperator: What seperator to use for key value mapping
-        comment_prefixes: The characters that determine a comment.
+        path: The path to either a directory or file.
+        hint: What kind of parser should be used.
+        collapse: Whether it should collapse everything or just a certain set of keys.
+        collapse_inverse: Invert the collapse function to collapse everything but the keys inside ``collapse``.
+        separator: The separator that should be used for parsing.
+        comment_prefixes: What is specified as a comment.
 
     Raises:
         FileNotFoundError: If the ``path`` is not a file.
     """
 
-    if not path.is_file():
-        raise FileNotFoundError(f"Could not parse {path} as a dictionary.")
-
     entry = path
     if isinstance(path, TargetPath):
         entry = path.get()
+
+    if not entry.is_file(follow_symlinks=True):
+        raise FileNotFoundError(f"Could not parse {path} as a dictionary.")
 
     options = ParserOptions(*args, **kwargs)
 
@@ -383,13 +922,15 @@ def parse_config(
     entry: FilesystemEntry,
     hint: Optional[str] = None,
     options: Optional[ParserOptions] = None,
-) -> ConfigParser:
+) -> ConfigurationParser:
     parser_type = _select_parser(entry, hint)
 
     parser = parser_type.create_parser(options)
-
     with entry.open() as fh:
-        open_file = io.TextIOWrapper(fh, encoding="utf-8")
+        if not isinstance(parser, Bin):
+            open_file = io.TextIOWrapper(fh, encoding="utf-8")
+        else:
+            open_file = io.BytesIO(fh.read())
         parser.read_file(open_file)
 
     return parser

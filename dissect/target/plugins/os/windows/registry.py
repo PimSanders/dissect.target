@@ -68,10 +68,15 @@ class RegistryPlugin(Plugin):
         "COMPONENTS",
         "DEFAULT",
         "ELAM",
+        "USER.DAT",  # Win 95/98/ME
+        "SYSTEM.DAT",  # Win 95/98/ME
+        "CLASSES.DAT",  # Win ME
+        "REG.DAT",  # Win 3.1
     ]
 
     def __init__(self, target: Target) -> None:
         super().__init__(target)
+
         self._root = VirtualHive()
         self._hive_collections = defaultdict(HiveCollection)
         self._hive_paths = []
@@ -83,9 +88,18 @@ class RegistryPlugin(Plugin):
         self._users_loaded = False
         self._init_registry()
 
+        self.key = lru_cache(4096)(self.key)
+
     def _init_registry(self) -> None:
         dirs = [
+            # Windows XP or newer
             ("sysvol/windows/system32/config", False),
+            # Windows NT3, NT4, 2k
+            ("sysvol/WINNT/system32/config", False),
+            # Windows 3.11, 95, 98, ME
+            ("sysvol/windows", False),
+            # ReactOS (alternative location)
+            ("sysvol/reactos", False),
             # RegBack hives are often empty files
             ("sysvol/windows/system32/config/RegBack", True),
         ]
@@ -217,7 +231,6 @@ class RegistryPlugin(Plugin):
         return self.key()
 
     @internal
-    @lru_cache(4096)
     def key(self, key: Optional[str] = None) -> KeyCollection:
         """Query the virtual registry on the given key.
 
@@ -329,7 +342,7 @@ class RegistryPlugin(Plugin):
     @internal
     def get_user_details(self, key: RegistryKey) -> UserDetails:
         """Return user details for the user who owns a registry hive that contains the provided key"""
-        if not key.hive or not key.hive.filepath:
+        if not key.hive or not getattr(key.hive, "filepath", None):
             return
 
         return self._hives_to_users.get(key.hive)

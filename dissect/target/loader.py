@@ -77,7 +77,7 @@ class Loader:
         raise NotImplementedError()
 
     @staticmethod
-    def find_all(path: Path) -> Iterator[Path]:
+    def find_all(path: Path, **kwargs) -> Iterator[Path]:
         """Finds all targets to load from ``path``.
 
         This can be used to open multiple targets from a target path that doesn't necessarily map to files on a disk.
@@ -154,7 +154,7 @@ def find_loader(
             log.debug("", exc_info=exception)
 
 
-def open(item: Union[str, Path], *args, **kwargs):
+def open(item: Union[str, Path], *args, **kwargs) -> Loader:
     """Opens a :class:`Loader` for a specific ``item``.
 
     This instantiates a :class:`Loader` for a specific ``item``.
@@ -176,7 +176,7 @@ def open(item: Union[str, Path], *args, **kwargs):
 
 register("local", "LocalLoader")
 register("remote", "RemoteLoader")
-register("targetd", "TargetdLoader")
+register("mqtt", "MQTTLoader")
 register("asdf", "AsdfLoader")
 register("tar", "TarLoader")
 register("vmx", "VmxLoader")
@@ -194,12 +194,16 @@ register("vma", "VmaLoader")
 register("kape", "KapeLoader")
 register("tanium", "TaniumLoader")
 register("itunes", "ITunesLoader")
+register("ab", "AndroidBackupLoader")
 register("target", "TargetLoader")
 register("log", "LogLoader")
 # Disabling ResLoader because of DIS-536
 # register("res", "ResLoader")
+register("overlay", "Overlay2Loader")
 register("phobos", "PhobosLoader")
 register("velociraptor", "VelociraptorLoader")
 register("smb", "SmbLoader")
 register("cb", "CbLoader")
+register("cyber", "CyberLoader")
+register("proxmox", "ProxmoxLoader")
 register("multiraw", "MultiRawLoader")  # Should be last

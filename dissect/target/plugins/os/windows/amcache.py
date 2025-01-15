@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 from datetime import datetime, timezone
+from typing import Iterator
 
 from dissect.util.ts import wintimestamp
 
@@ -63,7 +66,7 @@ FileAppcompatRecord = TargetRecordDescriptor(
         ("varint", "reference"),
         ("path", "path"),
         ("string", "language_code"),
-        ("digest", "digests"),
+        ("digest", "digest"),
         ("string", "program_id"),
         ("string", "pe_header_checksum"),
         ("string", "pe_size_of_image"),
@@ -123,7 +126,7 @@ ApplicationFileAppcompatRecord = TargetRecordDescriptor(
     [
         ("datetime", "mtime_regf"),
         ("string", "program_id"),
-        ("digest", "digests"),
+        ("digest", "digest"),
         ("path", "path"),
         ("string", "hash_path"),
         ("wstring", "name"),
@@ -221,7 +224,7 @@ class AmcachePluginOldMixin:
                     reference=int(subkey.name, 16),
                     path=self.target.fs.path(subkey_data["full_path"]) if subkey_data.get("full_path") else None,
                     language_code=subkey_data.get("language_code"),
-                    digests=[None, subkey_data["sha1"][-40:] if subkey_data.get("sha1") else None, None],
+                    digest=(None, subkey_data["sha1"][-40:] if subkey_data.get("sha1") else None, None),
                     program_id=subkey_data.get("program_id"),
                     pe_header_checksum=subkey_data.get("pe_header_checksum"),
                     pe_size_of_image=subkey_data.get("pe_size_of_image"),
@@ -292,13 +295,13 @@ class AmcachePluginOldMixin:
                     )
 
     @export(record=ProgramsAppcompatRecord)
-    def programs(self):
+    def programs(self) -> Iterator[ProgramsAppcompatRecord]:
         """Return Programs records from Amcache hive."""
         if self.amcache:
             yield from self.parse_programs()
 
     @export(record=FileAppcompatRecord)
-    def files(self):
+    def files(self) -> Iterator[FileAppcompatRecord]:
         """Return File records from Amcache hive."""
         if self.amcache:
             yield from self.parse_file()
@@ -321,9 +324,9 @@ class AmcachePlugin(AmcachePluginOldMixin, Plugin):
         * InventoryApplicationShortcut
 
     References:
-        https://binaryforay.blogspot.com/2015/04/appcompatcache-changes-in-windows-10.html
-        https://www.ssi.gouv.fr/uploads/2019/01/anssi-coriin_2019-analysis_amcache.pdf
-        https://aboutdfir.com/new-windows-11-pro-22h2-evidence-of-execution-artifact/
+        - https://binaryforay.blogspot.com/2015/04/appcompatcache-changes-in-windows-10.html
+        - https://cyber.gouv.fr/sites/default/files/2019/01/anssi-coriin_2019-analysis_amcache.pdf
+        - https://aboutdfir.com/new-windows-11-pro-22h2-evidence-of-execution-artifact/
 
     """
 
@@ -465,7 +468,7 @@ class AmcachePlugin(AmcachePluginOldMixin, Plugin):
             yield ApplicationFileAppcompatRecord(
                 mtime_regf=entry.timestamp,
                 program_id=entry_data.get("ProgramId"),
-                digests=[None, sha1_digest, None],
+                digest=(None, sha1_digest, None),
                 path=self.target.fs.path(entry_data.get("LowerCaseLongPath")),
                 link_date=parse_win_datetime(entry_data.get("LinkDate")),
                 hash_path=entry_data.get("LongPathHash"),
@@ -545,7 +548,7 @@ class AmcachePlugin(AmcachePluginOldMixin, Plugin):
             )
 
     @export(record=ApplicationAppcompatRecord)
-    def applications(self):
+    def applications(self) -> Iterator[ApplicationAppcompatRecord]:
         """Return InventoryApplication records from Amcache hive.
 
         Amcache is a registry hive that stores information about executed programs. The InventoryApplication key holds
@@ -559,7 +562,7 @@ class AmcachePlugin(AmcachePluginOldMixin, Plugin):
             yield from self.parse_inventory_application()
 
     @export(record=ApplicationFileAppcompatRecord)
-    def application_files(self):
+    def application_files(self) -> Iterator[ApplicationFileAppcompatRecord]:
         """Return InventoryApplicationFile records from Amcache hive.
 
         Amcache is a registry hive that stores information about executed programs. The InventoryApplicationFile key
@@ -573,7 +576,7 @@ class AmcachePlugin(AmcachePluginOldMixin, Plugin):
             yield from self.parse_inventory_application_file()
 
     @export(record=BinaryAppcompatRecord)
-    def drivers(self):
+    def drivers(self) -> Iterator[BinaryAppcompatRecord]:
         """Return InventoryDriverBinary records from Amcache hive.
 
         Amcache is a registry hive that stores information about executed programs. The InventoryDriverBinary key holds
@@ -588,7 +591,7 @@ class AmcachePlugin(AmcachePluginOldMixin, Plugin):
             yield from self.parse_inventory_driver_binary()
 
     @export(record=ShortcutAppcompatRecord)
-    def shortcuts(self):
+    def shortcuts(self) -> Iterator[ShortcutAppcompatRecord]:
         """Return InventoryApplicationShortcut records from Amcache hive.
 
         Amcache is a registry hive that stores information about executed programs. The InventoryApplicationShortcut
@@ -604,7 +607,7 @@ class AmcachePlugin(AmcachePluginOldMixin, Plugin):
             yield from self.parse_inventory_application_shortcut()
 
     @export(record=ContainerAppcompatRecord)
-    def device_containers(self):
+    def device_containers(self) -> Iterator[ContainerAppcompatRecord]:
         """Return InventoryDeviceContainer records from Amcache hive.
 
         Amcache is a registry hive that stores information about executed programs. The InventoryDeviceContainer key
@@ -619,7 +622,7 @@ class AmcachePlugin(AmcachePluginOldMixin, Plugin):
             yield from self.parse_inventory_device_container()
 
     @export(record=AppLaunchAppcompatRecord)
-    def applaunches(self):
+    def applaunches(self) -> Iterator[AppLaunchAppcompatRecord]:
         """Return AppLaunchAppcompatRecord records from Amcache applaunch files (Windows 11 22H2 or later).
 
         TODO: Research C:\\Windows\\appcompat\\pca\\PcaGeneralDb0.txt and
@@ -641,11 +644,11 @@ class AmcachePlugin(AmcachePluginOldMixin, Plugin):
                 )
 
 
-def parse_win_datetime(value: str):
+def parse_win_datetime(value: str) -> datetime | None:
     if value:
         return datetime.strptime(value, "%m/%d/%Y %H:%M:%S")
 
 
-def parse_win_timestamp(value: str):
+def parse_win_timestamp(value: str) -> datetime | None:
     if value:
         return wintimestamp(value)
