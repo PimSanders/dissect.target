@@ -1,40 +1,37 @@
-import datetime
-
 from dissect.sql import sqlite3
+from dissect.sql.sqlite3 import WALCheckpoint
 from dissect.sql.exceptions import NoCellData, InvalidPageType
 from dissect.esedb.tools import searchindex
 from dissect.util.ts import wintimestamp
 
+from dissect.target import Target
 from dissect.target.exceptions import (
-    FilesystemError,
     PluginError,
     RegistryKeyNotFoundError,
-    RegistryValueNotFoundError,
     UnsupportedPluginError,
 )
+from dissect.target.helpers.fsutil import TargetPath
 from dissect.target.helpers.record import TargetRecordDescriptor
 from dissect.target.plugin import Plugin, export
 
-from functools import lru_cache
 from dissect.ntfs.c_ntfs import c_ntfs
-from pprint import pprint
-import binascii
 
 SearchIndexFileInfoRecord = TargetRecordDescriptor(
     "filesystem/windows/searchindex/fileinformation",
     [
-        ("string", "workid"),  # remove me
+        ("string", "workid"),  # TODO: remove me
         ("datetime", "record_last_modified"),
         ("string", "filename"),
         ("datetime", "gathertime"),
-        ("varint", "SDID"),  # TODO: Check if this could be more human readable
+        ("varint", "SDID"),  # TODO: Check if this could be more human readable. The SDID that is retrieved from the databases does not seem to work in the same as described in the documentation (https://learn.microsoft.com/en-us/windows/win32/secauthz/security-descriptor-definition-language).
         ("varint", "size"),
         ("string", "date_modified"),
         ("string", "date_created"),
+        ("string", "date_accessed"),
         ("string", "owner"),
         ("string", "systemitemtype"),
         ("string", "fileattributes"),
-        ("string", "autosummary"),
+        ("string", "autosummary"), # Apparently obfuscated and compressed in XP, Vista and 7 (https://github.com/libyal/documentation/blob/8f22687893b85299e340f82cae54b482354a4f1d/Forensic%20analysis%20of%20the%20Windows%20Search%20database.pdf)
         ("path", "source"),
         ("string", "latest"),
         ("varint", "checkpointindex"),
@@ -44,7 +41,7 @@ SearchIndexFileInfoRecord = TargetRecordDescriptor(
 SearchIndexFileActivityRecord = TargetRecordDescriptor(
     "filesystem/windows/searchindex/fileactivity",
     [
-        ("string", "workid"),  # remove me
+        ("string", "workid"),  # TODO: remove me
         ("string", "file_contenturi"),
         ("datetime", "starttime"),
         ("datetime", "endtime"),
@@ -56,12 +53,13 @@ SearchIndexFileActivityRecord = TargetRecordDescriptor(
         ("path", "source"),
         ("string", "latest"),
         ("varint", "checkpointindex"),
-    ],  # TODO: Who performed
+    ],  # TODO: Who performed. Is not stored in the database? Available columns are: ScopeID, DocumentID, SDID, LastModified, TransactionFlags, TransactionExtendedFlags, CrawlNumberCrawled, StartAddressIdentifier, Priority, FileName, UserData, AppOwnerId, RequiredSIDs, DeletedCount, RunTime, FailureUpdateAttempts, ClientID, LastRequestedRunTime, StorageProviderId, CalculatedPropertyFlags.
 )
 
+# TODO: Add support for individual user indexes on Windows Server (https://github.com/fox-it/acquire/pull/200)
 FILES = [
-    "Applications/Windows/Windows.edb",  # Windows 10
-    "Applications/Windows/Windows.db",  # Windows 11 (ish? Doesn't seem to be consistent in all Win 11 implementations)
+    "Applications/Windows/Windows.edb",  # Windows 10 and earlier
+    "Applications/Windows/Windows.db",  # Windows 11 (ish? Doesn't seem to be consistent in all Windows 11 implementations)
 ]
 
 EVENTLOG_REGISTRY_KEY = "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Search"
@@ -71,6 +69,7 @@ WIN_DATETIME_FIELDS = [
     "System_Search_GatherTime",
     "System_DateModified",
     "System_DateCreated",
+    "System_DateAccessed",
     "System_ActivityHistory_EndTime",
     "System_ActivityHistory_StartTime",
 ]
@@ -80,7 +79,8 @@ PROPSTORE_INCLUDE_COLUMNS = [
     "System_Size",
     "System_DateModified",
     "System_DateCreated",
-    "System_FileOwner",
+    "System_DateAccessed",
+    "System_FileOwner", # TODO: Only showing for user created data like documents.
     "System_ItemPathDisplay",
     "System_ItemType",
     "System_FileAttributes",
@@ -91,13 +91,22 @@ PROPSTORE_INCLUDE_COLUMNS = [
     "System_ActivityHistory_StartTime",
     "System_ActivityHistory_EndTime",
     "System_ActivityHistory_AppId",
+    "System_Author",
 ]
 
 
 class SearchIndexPlugin(Plugin):
-    def __init__(self, target):
+    """Plugin that extracts records from the Windows Search Index database files.
+
+    References:
+        - https://www.aon.com/cyber-solutions/aon_cyber_labs/windows-search-index-the-forensic-artifact-youve-been-searching-for/
+        - https://github.com/libyal/documentation/blob/8f22687893b85299e340f82cae54b482354a4f1d/Forensic%20analysis%20of%20the%20Windows%20Search%20database.pdf
+    """
+
+    def __init__(self, target: Target):
         super().__init__(target)
         self._files = []
+        # Check if the registry key exists and get the DataDirectory value
         try:
             datadir = self.target.registry.key(EVENTLOG_REGISTRY_KEY).value("DataDirectory").value
         except RegistryKeyNotFoundError:
@@ -106,63 +115,125 @@ class SearchIndexPlugin(Plugin):
         except PluginError:
             self.target.log.error("Cannot access registry in target")
             return
-        # print(datadir)
-        # print(self.target.fs.path(datadir + "Windows.db").exists())
+        # Check if the database files exist and add them to the _files list
         for filename in FILES:
             databasepath = self.target.resolve(datadir + filename)
-            # print(databasepath.lower())
-            if target.fs.path(databasepath.lower()).exists():
+            if target.fs.path(databasepath).exists():
                 self._files.append(target.fs.path(databasepath))
 
-    def check_compatible(self):
+    def check_compatible(self) -> None:
         if not self._files:
             raise UnsupportedPluginError("No SearchIndex database files found")
 
-    def _get_edb_records(self, fh) -> list[dict]:
-        """
-        Get records from an EDB file
-        Depends on dissect.esedb/dissect/esedb/tools/searchindex.py
-        Gathers all interesting fields from the SystemIndex_Gthr and SystemIndex_PropertyStore tables and combines them into one dict
+    def _get_edb_records(self, path: TargetPath) -> list[dict]:
+        """Get records from an EDB file.
+
+        Depends on dissect.esedb/dissect/esedb/tools/searchindex.py.
+        Gathers all interesting fields from the SystemIndex_Gthr and SystemIndex_PropertyStore tables and combines them into one dict.
+
+        Args:
+            path (Path): Path to the EDB file
         """
 
-        si = searchindex.SearchIndex(fh)
-        gthr_table_rows = list(  # Get all interesting columns from the Gthr table
-            si.get_table_records("SystemIndex_Gthr", include_columns=["DocumentID", "LastModified", "SDID"])
+        # Open the EDB file with the SearchIndex class from dissect.esedb
+        si = searchindex.SearchIndex(path.open("rb"))
+
+        # Get all interesting columns from the Gthr table
+        gthr_table_rows = list(
+            # Possible include_columns are: ScopeID, DocumentID, SDID, LastModified, TransactionFlags, TransactionExtendedFlags, CrawlNumberCrawled, StartAddressIdentifier, Priority, FileName, UserData, AppOwnerId, RequiredSIDs, DeletedCount, RunTime, FailureUpdateAttempts, ClientID, LastRequestedRunTime, StorageProviderId, CalculatedPropertyFlags
+            si.get_table_records("SystemIndex_Gthr", include_columns=["DocumentID", "FileName", "LastModified", "SDID"])
         )
-        gthr_rows = {row["DocumentID"]: row for row in gthr_table_rows}  # Create a dict with DocumentID as key
+        # Create a dict with DocumentID as key
+        gthr_rows = {row["DocumentID"]: row for row in gthr_table_rows}
 
-        propstore_table_rows = list(  # Get all interesting columns from the PropStore table
+        # Create a dict with DocumentID as key and a dict with FileName, LastModified and SDID as value
+        gthr_records = {}
+        for document_id, row in gthr_rows.items():
+            if row["LastModified"] is not None:
+                last_modified = wintimestamp(int.from_bytes(row["LastModified"], "big"))
+            else:
+                last_modified = None
+            gthr_records[document_id] = {
+                "FileName": row["FileName"],
+                "LastModified": last_modified,
+                "SDID": row["SDID"],
+            }
+
+        # print(gthr_records[51])
+        # input()
+
+        # Get all interesting columns from the PropertyStore table
+        propstore_table_rows = list(
             si.get_table_records(
                 "SystemIndex_PropertyStore",
                 include_columns=PROPSTORE_INCLUDE_COLUMNS,
             )
         )
-        propstore_rows = {row["WorkID"]: row for row in propstore_table_rows}  # Create a dict with WorkID as key
+
+        # Create a dict with WorkID as key
+        propstore_rows = {row["WorkID"]: row for row in propstore_table_rows}
+
+        # print(propstore_rows[51])
+        # input()
+
+        # Create a dict with DocumentID as key and a dict with the column found, convert the LastModified field to a datetime object
+        propstore_records = {}
+        for work_id, row in propstore_rows.items():
+            for column_name in row:
+                if row[column_name] is None:
+                    continue
+                if column_name in WIN_DATETIME_FIELDS:
+                    if row[column_name] is not None:
+                        try:
+                            value = wintimestamp(int.from_bytes(row[column_name], "little"))
+                        except ValueError:
+                            value = None
+                else:
+                    value = row[column_name]
+                if work_id not in propstore_records.keys():
+                    propstore_records[work_id] = [{column_name: value}]
+                else:
+                    propstore_records[work_id][0][column_name] = value
+
+        # print(propstore_records[51])
+        # input()
 
         rows = []
-        max_id = max(max(gthr_rows.keys()), max(propstore_rows.keys()))  # Get the highest ID from both dicts
-        for iterator in range(max_id):  # Iterate over the highest ID
+        # Get the highest ID from both dicts
+        max_id = max(max(gthr_records.keys()), max(propstore_records.keys()))
+        # Iterate over the highest ID
+        for iterator in range(max_id):
             row = {"WorkID": iterator}
-            if iterator in gthr_rows:  # If the ID is in the gthr_rows dict, add it to the row
-                row = row | gthr_rows[iterator]
-            if iterator in propstore_rows:  # If the ID is in the propstore_rows dict, add it to the row
-                row = row | propstore_rows[iterator]
-            if len(row) > 1:  # If the row has more than one key, add it to the rows list
+            # If the ID is in the gthr_rows dict, add it to the row
+            if iterator in gthr_records:
+                row = row | gthr_records[iterator]
+            # If the ID is in the propstore_rows dict, add it to the row
+            if iterator in propstore_records:
+                for record in propstore_records[iterator]:
+                    rows.append(row | record | {"latest": False})
+                rows[-1]["latest"] = True
+            # If the row has more than one key, add it to the rows list
+            elif len(row) > 1:
                 rows.append(row)
+
+        # print(rows[534])
+        # input()
         return rows
 
-    def _get_sqlite_records(self, path) -> list[dict]:
-        """
-        Get records from a SQLite file
+    def _get_sqlite_records(self, path: TargetPath) -> list[dict]:
+        """Get records from a SQLite file.
+
         Gathers all interesting fields from the SystemIndex_Gthr and
-        SystemIndex_PropertyStore tables and combines them into one dict
+        SystemIndex_PropertyStore tables and combines them into one dict.
+
+        Args:
+            path (Path): Path to the SQLite file
         """
 
         db = sqlite3.SQLite3(path.open("rb"))  # Open the base SQLite file
         if (sqlite_db_wal := self.target.fs.path(str(path) + "-wal")).exists():  # If a WAL file exists, open it
             db_wal = sqlite3.SQLite3(path.open("rb"))  # Open the SQLite file again but with the WAL file
             db_wal.open_wal(sqlite_db_wal.open())
-            # TODO: Add check in following code to make sure the plugin runs without a WAL file
         else:
             db_wal = None
 
@@ -173,8 +244,9 @@ class SearchIndexPlugin(Plugin):
         if (gather_db_wal := self.target.fs.path(str(gather_file) + "-wal")).exists():
             gather_db.open_wal(gather_db_wal.open())
 
-        # Define gthr_records as a dict with DocumentID as key and a dict with FileName, LastModified and SDID as value
         gthr_table_rows = sorted(list(gather_db.table("SystemIndex_Gthr")), key=lambda x: x["DocumentID"])
+
+        # Define gthr_records as a dict with DocumentID as key and a dict with FileName, LastModified and SDID as value
         gthr_records = {}
         for row in gthr_table_rows:
             if (last_modified := row["LastModified"]) is not None:
@@ -184,18 +256,26 @@ class SearchIndexPlugin(Plugin):
                 "LastModified": last_modified,
                 "SDID": row["SDID"],
             }
-        print(gthr_records[3607])
-        input()
-        propstore_table_metadata = list(db.table("SystemIndex_1_PropertyStore_Metadata"))
+
+        # print(gthr_records[6])
+        # input()
+
+        propstore_metadata_table = list(db.table("SystemIndex_1_PropertyStore_Metadata"))
 
         # Create a workable metadata dict with the column name as value and the column id as key
         propstore_metadata = {}
-        for row in propstore_table_metadata:
+        for row in propstore_metadata_table:
             column_name = row["PropertyId"].replace(".", "_")
             if column_name in PROPSTORE_INCLUDE_COLUMNS:
                 propstore_metadata[row["Id"]] = column_name
 
+        # print(propstore_metadata)
+        # input()
+
         propstore_table_rows = sorted(list(db.table("SystemIndex_1_PropertyStore")), key=lambda x: x["WorkId"])
+
+        # print(propstore_table_rows[51])
+        # input()
 
         propstore_records = {}
         for row in propstore_table_rows:
@@ -214,19 +294,64 @@ class SearchIndexPlugin(Plugin):
                 propstore_records[work_id] = [{column_name: value, "checkpointindex": 0}]
             else:
                 propstore_records[work_id][0][column_name] = value
-        pprint(propstore_records[3607])
-        input()
+
+        # TODO: figure out which one should be used
+        #### STUFF THAT WAS ENABLED ####
+        # print(propstore_records[51])
+        # print(propstore_records[32])
+        # input()
+
+        # if db_wal:
+        #     # https://www.sqlite.org/wal.html
+        #     for checkpoint in db_wal.wal.checkpoints:
+        #         # print("CHECKPOINT", checkpoint.index)
+        #         rows = get_rows_from_checkpoint(checkpoint)
+        #         for row in rows:  # row = [workid, columnid, value]
+        #             # if row[1] == 51:
+        #             #     print(row)
+        #             work_id = row[0]
+        #             if row[1] not in propstore_metadata:
+        #                 continue
+        #             if (column_name := propstore_metadata[row[1]]) in WIN_DATETIME_FIELDS:
+        #                 if (value := row[2]) is not None:
+        #                     try:
+        #                         value = wintimestamp(int.from_bytes(value, "little"))
+        #                     except ValueError:
+        #                         value = None
+        #             else:
+        #                 value = row[2]
+
+        #             if work_id not in propstore_records.keys():
+        #                 propstore_records[work_id] = [{column_name: value, "checkpointindex": checkpoint.index}]
+        #             elif propstore_records[work_id][-1]["checkpointindex"] < checkpoint.index:
+        #                 if propstore_records[work_id][-1].get(column_name) == value:
+        #                     print("Not new. skipping")
+        #                     continue
+        #                 new_dict = propstore_records[work_id][-1].copy()
+        #                 new_dict["checkpointindex"] = checkpoint.index
+        #                 propstore_records[work_id].append(new_dict)
+        #                 if propstore_records[work_id]:
+        #                     propstore_records[work_id][-1][column_name] = value
+        #             else:
+        #                 propstore_records[work_id][-1][column_name] = value
+                    
+        # print("CHECK DONE")
+        # input()
+        ####
+
+        #### UNKNOWN ####
         if db_wal:
             for checkpoint in db_wal.wal.checkpoints:
-                # print("CHECKPOINT", checkpoint.index)
-                rows = get_rows_from_checkpoint(checkpoint)
-                for row in rows:  # row = [workid, columnid, value]
-                    if row[1] == 3607:
-                        print(row)
-                    # print(row)
-                    work_id = row[0]
+                diff = get_changes_between_db_and_checkpoint(db, checkpoint)
+                # print(checkpoint.index, get_workid_from_checkpoint(checkpoint))
+                # print(diff)
+                # input()
+
+                for row in diff:  # row = [workid, columnid, value]
+                    # If the column id is not in the metadata dict, skip the row
                     if row[1] not in propstore_metadata:
                         continue
+                    # If the column is a datetime field, convert the value to a datetime object
                     if (column_name := propstore_metadata[row[1]]) in WIN_DATETIME_FIELDS:
                         if (value := row[2]) is not None:
                             try:
@@ -234,90 +359,56 @@ class SearchIndexPlugin(Plugin):
                             except ValueError:
                                 value = None
                     else:
+                        # If the column is not a datetime field, just use the value
                         value = row[2]
-
-                    if work_id not in propstore_records.keys():
-                        propstore_records[work_id] = [{column_name: value, "checkpointindex": checkpoint.index}]
-                    elif propstore_records[work_id][-1]["checkpointindex"] < checkpoint.index:
-                        if propstore_records[work_id][-1].get(column_name) == value:
-                            # print("Not new. skipping")
-                            continue
-                        new_dict = propstore_records[work_id][-1].copy()
-                        new_dict["checkpointindex"] = checkpoint.index
-                        propstore_records[work_id].append(new_dict)
-                        propstore_records[work_id][-1][column_name] = value
+                    # print(row, column_name, value)
+                    if row[0] not in propstore_records.keys():
+                        # If the workid is not in the propstore_records dict, add it.
+                        # This happens if the WAL contains new workids(/files) which aren't present in the base SQLite file.
+                        propstore_records[row[0]] = [
+                            {
+                                column_name: value,
+                                "checkpointindex": checkpoint.index,
+                            }
+                        ]
                     else:
-                        propstore_records[work_id][-1][column_name] = value
-        print("CHECK DONE")
-        input()
-        # for record in propstore_records:
-        #     if len(propstore_records[record]) > 1:
-        #         pprint(propstore_records[record])
-        #         input()
-        # pprint(gthr_records[3607])
-        # input()
-
-        # if db_wal:
-        #     for checkpoint in db_wal.wal.checkpoints:
-        #         diff = get_changes_between_db_and_checkpoint(db, checkpoint)
-        #         print(checkpoint.index, get_workid_from_checkpoint(checkpoint))
-        #         # pprint(diff)
-
-        #         for row in diff:  # row = [workid, columnid, value]
-        #             if row[1] not in propstore_metadata:  # If the column id is not in the metadata dict, skip the row
-        #                 continue
-        #             if (
-        #                 column_name := propstore_metadata[row[1]]
-        #             ) in WIN_DATETIME_FIELDS:  # If the column is a datetime field, convert the value to a datetime object
-        #                 if (value := row[2]) is not None:
-        #                     try:
-        #                         value = wintimestamp(int.from_bytes(value, "little"))
-        #                     except ValueError:
-        #                         value = None
-        #             else:
-        #                 value = row[2]  # If the column is not a datetime field, just use the value
-        #             print(row, column_name, value)
-        #             if row[0] not in propstore_records.keys():
-        #                 # If the workid is not in the propstore_records dict, add it.
-        #                 # This happens if the WAL contains new workids(/files) which aren't present in the base SQLite file.
-        #                 propstore_records[row[0]] = [
-        #                     {
-        #                         column_name: value,
-        #                         "checkpointindex": checkpoint.index,
-        #                     }
-        #                 ]
-        #             else:
-        #                 if propstore_records[row[0]][-1]["checkpointindex"] < checkpoint.index:
-        #                     new_dict = propstore_records[row[0]][-1].copy()
-        #                     new_dict["checkpointindex"] = checkpoint.index
-        #                     propstore_records[row[0]].append(new_dict)
-        #                 propstore_records[row[0]][-1][column_name] = value
-        #             input()
+                        if propstore_records[row[0]][-1]["checkpointindex"] < checkpoint.index:
+                            new_dict = propstore_records[row[0]][-1].copy()
+                            new_dict["checkpointindex"] = checkpoint.index
+                            propstore_records[row[0]].append(new_dict)
+                        propstore_records[row[0]][-1][column_name] = value
+                    # input()
+        ####
 
         rows = []
-        max_id = max(max(gthr_records.keys()), max(propstore_records.keys()))  # Get the highest ID from both dicts
-        for iterator in range(max_id):  # Iterate over the highest ID
+        # Get the highest ID from both dicts
+        max_id = max(max(gthr_records.keys()), max(propstore_records.keys()))
+        # Iterate over the highest ID
+        for iterator in range(max_id):
             row = {"WorkID": iterator}
-            if iterator in gthr_records:  # If the ID is in the gthr_rows dict, add it to the row
+            # If the ID is in the gthr_rows dict, add it to the row
+            if iterator in gthr_records:
                 row = row | gthr_records[iterator]
-            if iterator in propstore_records:  # If the ID is in the propstore_rows dict, add it to the row
+            # If the ID is in the propstore_rows dict, add it to the row
+            if iterator in propstore_records:
                 for record in propstore_records[iterator]:
                     rows.append(row | record | {"latest": False})
                 rows[-1]["latest"] = True
-            elif len(row) > 1:  # If the row has more than one key, add it to the rows list
+            # If the row has more than one key, add it to the rows list
+            elif len(row) > 1:
                 rows.append(row)
+
+        # print(rows[52])
+        # input()
+
         return rows
 
     @export(record=SearchIndexFileInfoRecord)
     def searchindex(self):
-        """
-        Get records from the SearchIndex database files
-
-        """
+        """Yield records from the SearchIndex database files."""
         for path in self._files:
-            fh = path.open("rb")
             if path.name.endswith(".edb"):
-                records = self._get_edb_records(fh)
+                records = self._get_edb_records(path)
             elif path.name.endswith(".db"):
                 records = self._get_sqlite_records(path)
 
@@ -339,11 +430,11 @@ class SearchIndexPlugin(Plugin):
                         _target=self.target,
                     )
                 else:
-                    if not (filename := record.get("System_ItemPathDisplay")) is None:
+                    if (filename := record.get("System_ItemPathDisplay")) is not None:
                         filename = filename.replace("\\", "/")
-                    if not (autosummary := record.get("System_Search_AutoSummary")) is None:
+                    if (autosummary := record.get("System_Search_AutoSummary")) is not None:
                         autosummary = autosummary.encode("utf-8").hex()
-                    if not (fileattributes := record.get("System_FileAttributes")) is None:
+                    if (fileattributes := record.get("System_FileAttributes")) is not None:
                         fileattributes = str(c_ntfs.FILE_ATTRIBUTE(fileattributes)).replace("FILE_ATTRIBUTE.", "")
                     yield SearchIndexFileInfoRecord(
                         workid=record.get("WorkID"),
@@ -356,6 +447,7 @@ class SearchIndexPlugin(Plugin):
                         else None,
                         date_modified=record.get("System_DateModified"),
                         date_created=record.get("System_DateCreated"),
+                        date_accessed=record.get("System_DateAccessed"),
                         owner=record.get("System_FileOwner"),
                         systemitemtype=systemitemtype,
                         fileattributes=fileattributes,
@@ -367,7 +459,12 @@ class SearchIndexPlugin(Plugin):
                     )
 
 
-def get_workid_from_checkpoint(checkpoint):
+def get_workid_from_checkpoint(checkpoint: WALCheckpoint) -> list[str]:
+    """Get all workids from a checkpoint.
+
+    Args:
+        checkpoint (Checkpoint): The checkpoint to get the workids from.
+    """
     workids = set()
     for frame in checkpoint.frames:
         try:
@@ -381,7 +478,13 @@ def get_workid_from_checkpoint(checkpoint):
     return list(workids)
 
 
-def get_changes_between_db_and_checkpoint(db, checkpoint):
+def get_changes_between_db_and_checkpoint(db: sqlite3, checkpoint: WALCheckpoint) -> list:
+    """Get all changes between the database and a checkpoint.
+
+    Args:
+        db (SQLite3): The SQLite3 database to compare the checkpoint to.
+        checkpoint (Checkpoint): The checkpoint to compare to the database.
+    """
     different_values = []
     for frame in checkpoint.frames:
         try:
@@ -411,7 +514,12 @@ def get_changes_between_db_and_checkpoint(db, checkpoint):
     return different_values
 
 
-def get_rows_from_checkpoint(checkpoint):
+def get_rows_from_checkpoint(checkpoint: WALCheckpoint) -> list[list]:
+    """Get all rows from a checkpoint.
+
+    Args:
+        checkpoint (Checkpoint): The checkpoint to get the rows from.
+    """
     rows = []
     for frame in checkpoint.frames:
         try:
