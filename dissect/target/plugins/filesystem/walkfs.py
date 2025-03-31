@@ -7,6 +7,7 @@ from dissect.target.filesystem import FilesystemEntry, LayerFilesystemEntry
 from dissect.target.helpers.record import TargetRecordDescriptor
 from dissect.target.plugin import Plugin, arg, export
 from dissect.target.target import Target
+import math
 
 FilesystemRecord = TargetRecordDescriptor(
     "filesystem/entry",
@@ -22,6 +23,7 @@ FilesystemRecord = TargetRecordDescriptor(
         ("uint32", "uid"),
         ("uint32", "gid"),
         ("string[]", "fstypes"),
+        ("float", "entropy"),
     ],
 )
 
@@ -35,7 +37,8 @@ class WalkFSPlugin(Plugin):
 
     @export(record=FilesystemRecord)
     @arg("--walkfs-path", default="/", help="path to recursively walk")
-    def walkfs(self, walkfs_path: str = "/") -> Iterator[FilesystemRecord]:
+    @arg("--calculate-entropy", action="store_true", help="calculate entropy for each file")
+    def walkfs(self, walkfs_path: str = "/", calculate_entropy: bool = False) -> Iterator[FilesystemRecord]:
         """Walk a target's filesystem and return all filesystem entries."""
 
         path = self.target.fs.path(walkfs_path)
@@ -49,19 +52,53 @@ class WalkFSPlugin(Plugin):
             return
 
         for entry in self.target.fs.recurse(walkfs_path):
+            print(entry)
             try:
-                yield generate_record(self.target, entry)
+                entropy = 0
+
+                if not entry.is_dir() and calculate_entropy:
+                    entropy = _calculate_entropy(entry, self.target)
+
+                yield generate_record(self.target, entry, entropy)
 
             except FileNotFoundError as e:
                 self.target.log.warning("File not found: %s", entry)
                 self.target.log.debug("", exc_info=e)
             except Exception as e:
-                self.target.log.warning("Exception generating record for: %s", entry)
+                self.target.log.warning("Exception generating record for: %s, %s", entry, e)
                 self.target.log.debug("", exc_info=e)
                 continue
 
 
-def generate_record(target: Target, entry: FilesystemEntry) -> FilesystemRecord:
+def _calculate_entropy(path: str, target) -> float:
+    """Calculate the entropy of a file.
+    
+    Args:
+        path: Path to the file to calculate the entropy of.
+    
+    Returns:
+        The calculated entropy.
+
+    References:
+        - https://stackoverflow.com/questions/59528143/compute-entropy-of-a-pickle-file
+    """
+    with path.open() as file:
+        counters = {byte: 0 for byte in range(2 ** 8)}  # start all counters with zeros
+
+        for byte in file.read():  # read in chunks for large files
+            counters[byte] += 1  # increase counter for specified byte
+
+        filesize = file.tell()  # we can get file size by reading current position
+
+        if filesize > 0:
+            probabilities = [counter / filesize for counter in counters.values()]  # calculate probabilities for each byte
+            entropy = -sum(probability * math.log2(probability) for probability in probabilities if probability > 0)  # final sum
+        else:
+            entropy = 0  # set entropy to 0 if file size is zero
+        return entropy
+
+
+def generate_record(target: Target, entry: FilesystemEntry, entropy: str) -> FilesystemRecord:
     """Generate a :class:`FilesystemRecord` from the given :class:`FilesystemEntry`.
 
     Args:
@@ -90,5 +127,6 @@ def generate_record(target: Target, entry: FilesystemEntry) -> FilesystemRecord:
         uid=stat.st_uid,
         gid=stat.st_gid,
         fstypes=fs_types,
+        entropy=entropy,
         _target=target,
     )
