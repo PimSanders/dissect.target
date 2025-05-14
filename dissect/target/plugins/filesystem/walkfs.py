@@ -57,7 +57,7 @@ class WalkFSPlugin(Plugin):
                 entropy = 0
 
                 if not entry.is_dir() and calculate_entropy:
-                    entropy = _calculate_entropy(entry, self.target)
+                    entropy = _calculate_entropy(entry)
 
                 yield generate_record(self.target, entry, entropy)
 
@@ -70,7 +70,7 @@ class WalkFSPlugin(Plugin):
                 continue
 
 
-def _calculate_entropy(path: str, target) -> float:
+def _calculate_entropy(path: str) -> float:
     """Calculate the entropy of a file.
     
     Args:
