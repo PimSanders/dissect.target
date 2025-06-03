@@ -52,7 +52,6 @@ class WalkFSPlugin(Plugin):
             return
 
         for entry in self.target.fs.recurse(walkfs_path):
-            print(entry)
             try:
                 entropy = 0
 
