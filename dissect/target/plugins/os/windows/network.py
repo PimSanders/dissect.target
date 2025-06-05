@@ -244,8 +244,12 @@ def _get_config_value(key: RegistryKey, name: str, sep: str | None = None) -> se
 
 def _construct_interface(key: RegistryKey, ip_key: str, subnet_key: str) -> set[str]:
     interface = ""
+
     if ip := _get_config_value(key, ip_key):
         interface = next(iter(ip))
+
+    if not interface:
+        return set()
 
     if subnet := _get_config_value(key, subnet_key):
         interface = f"{interface}/{next(iter(subnet))}"
@@ -284,7 +288,7 @@ class WindowsNetworkPlugin(NetworkPlugin):
                 # Extract a network device name for given interface id
                 try:
                     name_key = self.target.registry.key(
-                        f"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Network\\{{4D36E972-E325-11CE-BFC1-08002BE10318}}\\{net_cfg_instance_id}\\Connection"  # noqa: E501
+                        f"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Network\\{{4D36E972-E325-11CE-BFC1-08002BE10318}}\\{net_cfg_instance_id}\\Connection"
                     )
                     if value_name := _try_value(name_key, "Name"):
                         device_info["name"] = value_name
@@ -294,7 +298,7 @@ class WindowsNetworkPlugin(NetworkPlugin):
                 # Extract the metric value from the interface registry key
                 try:
                     interface_key = self.target.registry.key(
-                        f"HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\{net_cfg_instance_id}"  # noqa: E501
+                        f"HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\{net_cfg_instance_id}"
                     )
                     if value_metric := _try_value(interface_key, "InterfaceMetric"):
                         device_info["metric"] = value_metric

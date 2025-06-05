@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 import stat
-from typing import Iterator
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -13,6 +15,9 @@ from dissect.target.helpers.nfs.nfs3 import (
     NfsTime,
     SpecData,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 @pytest.fixture
@@ -68,6 +73,7 @@ def test_get_subdirectory(nfs_filesystem: NfsFilesystem, mock_nfs_client: MagicM
 
 
 def test_get_from_entry(mock_nfs_client: MagicMock, nfs_filesystem_entry: NfsFilesystemEntry) -> None:
+    nfs_filesystem_entry._attributes.type = FileType.DIR
     mock_nfs_client.lookup.return_value = MagicMock(
         object=FileHandle(opaque=b"subdir_handle"), obj_attributes=MagicMock()
     )

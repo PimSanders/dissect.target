@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -9,8 +10,10 @@ import pytest
 from dissect.target.helpers.regutil import VirtualHive, VirtualKey
 from dissect.target.plugins.os.windows._os import WindowsPlugin
 from dissect.target.plugins.os.windows.network import WindowsNetworkPlugin
-from dissect.target.target import Target
 from tests.conftest import change_controlset
+
+if TYPE_CHECKING:
+    from dissect.target.target import Target
 
 
 @dataclass
@@ -127,6 +130,20 @@ REGISTRY_KEY_CONNECTION = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Network\\{4
             },
             id="OTHER empty",
         ),
+        pytest.param(
+            {
+                "NetCfgInstanceId": "TESTINGINSTANCEID",
+                "EnableDHCP": 1,
+                "DhcpIPAddress": "0.0.0.0",
+                "DhcpSubnetMask": "255.255.255.0",
+            },
+            {
+                "_NO_INTERFACES": True,
+                "enabled": True,
+                "cidr": {},  # and not {'/255.255.255.0'}
+            },
+            id="invalid cidr",
+        ),
     ],
 )
 def test_windows_network(
@@ -163,6 +180,11 @@ def test_windows_network(
         assert network.dns() == expected_values.get("dns", [])
         assert network.gateways() == expected_values.get("gateway", [])
         assert network.macs() == expected_values.get("mac", [])
+
+        if expected_values.get("_NO_INTERFACES"):
+            with pytest.raises(StopIteration):
+                next(iter(network.interfaces()))
+            return
 
         network_interface = next(iter(network.interfaces()))
         assert network_interface.name == expected_values.get("name")
@@ -347,7 +369,7 @@ def test_network_dhcp_and_static(
     property(MagicMock(return_value=["ControlSet001", "ControlSet002", "ControlSet003"])),
 )
 def test_regression_duplicate_ips(target_win: Target, hive_hklm: VirtualHive) -> None:
-    """Regression test for https://github.com/fox-it/dissect.target/issues/877"""
+    """Regression test for https://github.com/fox-it/dissect.target/issues/877."""
 
     change_controlset(hive_hklm, 3)
 

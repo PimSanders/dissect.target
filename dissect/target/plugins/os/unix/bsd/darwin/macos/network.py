@@ -29,7 +29,7 @@ class MacOSNetworkPlugin(NetworkPlugin):
 
     def _plistnetwork(self) -> dict:
         if (preferences := self.target.fs.path("/Library/Preferences/SystemConfiguration/preferences.plist")).exists():
-            return plistlib.load(preferences.open())
+            return plistlib.load(preferences.open()) or {}
 
         raise FileNotFoundError("Couldn't find preferences file")
 
@@ -97,5 +97,5 @@ class MacOSNetworkPlugin(NetworkPlugin):
                 )
 
             except Exception as e:
-                self.target.log.warning("Error reading configuration for network device %s", name, exc_info=e)
-                continue
+                self.target.log.warning("Error reading configuration for network device %s", name)
+                self.target.log.debug("", exc_info=e)

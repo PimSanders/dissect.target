@@ -6,18 +6,13 @@ import logging
 import re
 import sys
 from collections import deque
+from collections.abc import ItemsView, Iterable, Iterator, KeysView
 from configparser import ConfigParser, MissingSectionHeaderError
 from dataclasses import dataclass
-from fnmatch import fnmatch
-from pathlib import Path
-from types import TracebackType
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
-    ItemsView,
-    Iterable,
-    Iterator,
-    KeysView,
     Literal,
     TextIO,
 )
@@ -25,8 +20,13 @@ from typing import (
 from defusedxml import ElementTree
 
 from dissect.target.exceptions import ConfigurationParsingError, FileNotFoundError
-from dissect.target.filesystem import FilesystemEntry
-from dissect.target.helpers.fsutil import TargetPath
+from dissect.target.helpers.utils import to_list
+
+if TYPE_CHECKING:
+    from pathlib import Path
+    from types import TracebackType
+
+    from typing_extensions import Self
 
 try:
     from ruamel.yaml import YAML
@@ -51,9 +51,8 @@ log = logging.getLogger(__name__)
 
 
 def _update_dictionary(current: dict[str, Any], key: str, value: Any) -> None:
-    if prev_value := current.get(key):
-        if isinstance(prev_value, dict):
-            # We can assume the value would be a dict too here.
+    if (prev_value := current.get(key)) is not None:  #  "" is a value
+        if isinstance(prev_value, dict) and isinstance(value, dict):
             prev_value.update(value)
             return
 
@@ -70,25 +69,25 @@ def _update_dictionary(current: dict[str, Any], key: str, value: Any) -> None:
 class PeekableIterator:
     # https://more-itertools.readthedocs.io/en/stable/_modules/more_itertools/more.html#peekable
 
-    def __init__(self, iterable):
+    def __init__(self, iterable: Iterable[str]):
         self._iterator = iter(iterable)
         self._cache = deque()
 
-    def __iter__(self):
+    def __iter__(self) -> PeekableIterator:
         return self
 
-    def __next__(self):
+    def __next__(self) -> str:
         if self._cache:
             return self._cache.popleft()
 
         return next(self._iterator)
 
-    def peek(self):
+    def peek(self) -> str | None:
         if not self._cache:
             try:
                 self._cache.append(next(self._iterator))
             except StopIteration:
-                return
+                return None
         return self._cache[0]
 
 
@@ -154,7 +153,7 @@ class ConfigurationParser:
         Args:
             fh: The text to parse.
         """
-        raise NotImplementedError()
+        raise NotImplementedError
 
     def get(self, item: str, default: Any | None = None) -> Any:
         return self.parsed_data.get(item, default)
@@ -176,6 +175,44 @@ class ConfigurationParser:
 
         if not isinstance(self.parsed_data, dict):
             self.parsed_data = self._collapse_dict(self.parsed_data, False)
+
+    def merge(self, other: ConfigurationParser) -> ConfigurationParser:
+        """Merge the contents of another parser into this one.
+        On conflict, the values of the other parser will be used.
+
+        Args:
+            other: The other parser to merge.
+
+        Returns:
+            The merged parser.
+        """
+
+        self._merge(self.parsed_data, other.parsed_data)
+        return self
+
+    def _merge(self, dict1: dict, dict2: dict) -> dict:
+        for key, value2 in dict2.items():
+            value1 = dict1.get(key)
+            if value1 is None:
+                # Result does not have key yet, add it
+                dict1[key] = value2
+                continue
+
+            collapse = self.collapse_all or self._collapse_check(key)
+
+            if collapse:
+                if isinstance(value1, dict) and isinstance(value2, dict):
+                    self._merge(value1, value2)  # There should only be one, merge both
+                else:
+                    dict1[key] = value2
+            else:
+                combined = to_list(value1) + to_list(value2)
+                # An empty string clears the list of values for the current key
+                # Possibly turn this into an option if other parsers require different behavior
+                combined = combined[combined.index("") + 1 :] if "" in combined else combined
+                dict1[key] = combined
+
+        return dict1
 
     def keys(self) -> KeysView:
         return self.parsed_data.keys()
@@ -205,11 +242,11 @@ class Default(ConfigurationParser):
         <empty_space><comment>  -> skip
     """
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.SEPARATOR = re.compile(rf"\s*[{''.join(self.separator)}]\s*")
         self.COMMENTS = re.compile(rf"\s*[{''.join(self.comment_prefixes)}]")
-        self.skip_lines = self.comment_prefixes + ("\n",)
+        self.skip_lines = (*self.comment_prefixes, "\n")
 
     def line_reader(self, fh: TextIO, strip_comments: bool = True) -> Iterator[str]:
         for line in fh:
@@ -229,7 +266,7 @@ class Default(ConfigurationParser):
             if line.startswith((" ", "\t")):
                 # This part was indented so it is a continuation of the previous key
                 prev_value = information_dict.get(prev_key)
-                information_dict[prev_key] = " ".join([prev_value, line.strip()])
+                information_dict[prev_key] = f"{prev_value} {line.strip()}"
                 continue
 
             prev_key, *value = self.SEPARATOR.split(line, 1)
@@ -241,9 +278,9 @@ class Default(ConfigurationParser):
 
 
 class CSVish(Default):
-    """Parses CSV-ish config files (does not confirm to CSV standard!)"""
+    """Parses CSV-ish config files (does not confirm to CSV standard!)."""
 
-    def __init__(self, *args, fields: tuple[str], **kwargs) -> None:
+    def __init__(self, *args, fields: tuple[str, ...], **kwargs):
         self.fields = fields
         self.num_fields = len(self.fields)
         self.maxsplit = self.num_fields - 1
@@ -256,11 +293,8 @@ class CSVish(Default):
             line = raw_line.strip()
             columns = re.split(self.SEPARATOR, line, maxsplit=self.maxsplit)
 
-            if len(columns) < self.num_fields:
-                # keep unparsed lines separate (often env vars)
-                data = {"line": line}
-            else:
-                data = dict(zip(self.fields, columns))
+            # keep unparsed lines separate (often env vars)
+            data = {"line": line} if len(columns) < self.num_fields else dict(zip(self.fields, columns))
 
             information_dict[str(i)] = data
 
@@ -268,9 +302,9 @@ class CSVish(Default):
 
 
 class Ini(ConfigurationParser):
-    """Parses an ini file according using the built-in python ConfigParser"""
+    """Parses an ini file according using the built-in Python ``ConfigParser``."""
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         self.parsed_data = ConfigParser(
@@ -282,17 +316,16 @@ class Ini(ConfigurationParser):
         )
         self.parsed_data.optionxform = str
 
-    def parse_file(self, fh: io.TextIO) -> None:
+    def parse_file(self, fh: TextIO) -> None:
         offset = fh.tell()
         try:
-            self.parsed_data.read_file(fh)
-            return
+            return self.parsed_data.read_file(fh)
         except MissingSectionHeaderError:
             pass
 
         fh.seek(offset)
         open_file = io.StringIO("[DEFAULT]\n" + fh.read())
-        self.parsed_data.read_file(open_file)
+        return self.parsed_data.read_file(open_file)
 
 
 class Txt(ConfigurationParser):
@@ -304,7 +337,7 @@ class Txt(ConfigurationParser):
 
 
 class Bin(ConfigurationParser):
-    """Read the file into ``binary`` and show the number of bytes read"""
+    """Read the file into ``binary`` and show the number of bytes read."""
 
     def parse_file(self, fh: io.BytesIO) -> None:
         self.parsed_data = {"binary": fh.read(), "size": str(fh.tell())}
@@ -341,15 +374,13 @@ class Xml(ConfigurationParser):
 
         # content goes into the text folder
         # we don't use special prefixes ($) because XML docs may use them anyway (even though they are forbidden)
-        if tree.text:
-            if text := tree.text.strip(" \n\r"):
-                result["text"] = text
+        if tree.text and (text := tree.text.strip(" \n\r")):
+            result["text"] = text
 
         # if you need to store meta-data, you can extend add more entries here... CDATA, Comments, errors
-        result = {tree.tag: result} if root else result
-        return result
+        return {tree.tag: result} if root else result
 
-    def _fix(self, content: str, position: tuple(int, int)) -> str:
+    def _fix(self, content: str, position: tuple[int, int]) -> str:
         """Quick heuristic fix. If there is an invalid token, just remove it."""
         lineno, offset = position
         lines = content.split("\n")
@@ -372,9 +403,9 @@ class Xml(ConfigurationParser):
             try:
                 tree = self._tree(ElementTree.fromstring(document), root=True)
                 break
-            except ElementTree.ParseError as err:
+            except ElementTree.ParseError as e:
                 errors += 1
-                document = self._fix(document, err.position)
+                document = self._fix(document, e.position)
 
         if not tree:
             # Error limit reached. Thus we consider the document not parseable.
@@ -414,7 +445,7 @@ class ListUnwrapper:
         if not isinstance(data, dict):
             return data
 
-        root = dict()
+        root = {}
         for key, value in data.items():
             _value = ListUnwrapper._unwrap_dict_list(value)
             if isinstance(_value, dict):
@@ -439,7 +470,7 @@ class ListUnwrapper:
 class Json(ConfigurationParser):
     """Parses a JSON file."""
 
-    def parse_file(self, fh: TextIO):
+    def parse_file(self, fh: TextIO) -> None:
         parsed_data = json.load(fh)
         self.parsed_data = ListUnwrapper.unwrap(parsed_data)
 
@@ -479,13 +510,13 @@ class Env(ConfigurationParser):
 
     RE_KV = re.compile(r"^(?P<key>.+?)=(?P<value>(\".+?\")|(\'.+?\')|(.*?))?(?P<comment> \#.+?)?$")
 
-    def __init__(self, comments: bool = True, *args, **kwargs) -> None:
+    def __init__(self, comments: bool = True, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.comments = comments
         self.parsed_data: dict | tuple[dict, str | None] = {}
 
     def parse_file(self, fh: TextIO) -> None:
-        for line in fh.readlines():
+        for line in fh:
             # Blank lines are ignored.
             # Lines beginning with ``#`` are processed as comments and ignored.
             if not line or line[0] == "#" or "=" not in line:
@@ -547,13 +578,13 @@ class ScopeManager:
         _previous: The node before the current (changed) node.
     """
 
-    def __init__(self) -> None:
+    def __init__(self):
         self._parents = {}
         self._root = {}
         self._current = self._root
         self._previous = None
 
-    def __enter__(self) -> ScopeManager:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(
@@ -571,13 +602,26 @@ class ScopeManager:
 
     def push(self, name: str, keep_prev: bool = False) -> Literal[True]:
         """Push a new key to the :attr:`_current` dictionary and return that we did."""
-        child = self._current.get(name, {})
-
+        child = self._current.get(name)
+        new_child = {}
         parent = self._current
-        self._parents[id(child)] = parent
-        parent[name] = child
+        if isinstance(child, dict):
+            # A second scope with the same name, turn the existing one into a list and append a new one
+            parent[name] = [child, new_child]
+            child = parent[name]
+        elif isinstance(child, list):
+            # Multiple scopes with the same name, append a new one to the list
+            child.append(new_child)
+        elif isinstance(child, str):
+            # Child is not a scope but a scalar value, do nothing
+            pass
+        else:
+            # Create a new scope
+            parent[name] = new_child
+
+        self._parents[id(new_child)] = parent
         self._set_prev(keep_prev)
-        self._current = child
+        self._current = new_child
         return True
 
     def pop(self, keep_prev: bool = False) -> bool:
@@ -768,7 +812,7 @@ class SystemD(Indentation):
                     prev_values, prev_key = self._update_continued_values(
                         func=manager.update,
                         key=prev_key,
-                        values=prev_values + [continued_value],
+                        values=[*prev_values, continued_value],
                     )
                     continue
 
@@ -776,7 +820,9 @@ class SystemD(Indentation):
 
             self.parsed_data = manager._root
 
-    def _update_continued_values(self, func: Callable, key, values: list[str]) -> tuple[list, None]:
+    def _update_continued_values(
+        self, func: Callable[[str, str], None], key: str, values: list[str]
+    ) -> tuple[list, None]:
         value = " ".join(values)
         func(key, value)
         return [], None
@@ -889,7 +935,7 @@ KNOWN_FILES: dict[str, type[ConfigurationParser]] = {
 }
 
 
-def parse(path: FilesystemEntry | TargetPath | Path, hint: str | None = None, *args, **kwargs) -> ConfigurationParser:
+def parse(path: Path, hint: str | None = None, *args, **kwargs) -> ConfigurationParser:
     """Parses the content of an ``path`` or ``entry`` to a dictionary.
 
     Args:
@@ -904,45 +950,55 @@ def parse(path: FilesystemEntry | TargetPath | Path, hint: str | None = None, *a
         FileNotFoundError: If the ``path`` is not a file.
     """
 
-    entry = path
-    if isinstance(path, TargetPath):
-        entry = path.get()
-
-    if not isinstance(entry, Path) and not entry.is_file(follow_symlinks=True):
+    if not path.is_file():
         raise FileNotFoundError(f"Could not parse {path} as a dictionary.")
 
     options = ParserOptions(*args, **kwargs)
 
-    return parse_config(entry, hint, options)
+    return parse_config(path, hint, options)
 
 
 def parse_config(
-    entry: FilesystemEntry | Path,
+    entry: Path,
     hint: str | None = None,
     options: ParserOptions | None = None,
 ) -> ConfigurationParser:
     parser_type = _select_parser(entry, hint)
 
     parser = parser_type.create_parser(options)
-    with entry.open("rb") if isinstance(entry, Path) else entry.open() as fh:
-        if not isinstance(parser, Bin):
-            open_file = io.TextIOWrapper(fh, encoding="utf-8")
-        else:
-            open_file = io.BytesIO(fh.read())
+    with entry.open("rb") as fh:
+        open_file = io.TextIOWrapper(fh, encoding="utf-8") if not isinstance(parser, Bin) else io.BytesIO(fh.read())
         parser.read_file(open_file)
+
+    if isinstance(parser, SystemD):
+        return _parse_drop_files(entry, options, parser)
 
     return parser
 
 
-def _select_parser(entry: FilesystemEntry, hint: str | None = None) -> ParserConfig:
+def _parse_drop_files(path: Path, options: ParserOptions, main_parser: ConfigurationParser) -> ConfigurationParser:
+    if not (drop_folder := path.with_name(path.name + ".d")).exists():
+        return main_parser
+
+    for drop_file in sorted(drop_folder.glob("*.conf")):
+        if not drop_file.is_file():
+            continue
+
+        drop_file_parser = ParserConfig(SystemD).create_parser(options)
+        with drop_file.open("r") as fh:
+            drop_file_parser.read_file(fh)
+            main_parser.merge(drop_file_parser)
+
+    return main_parser
+
+
+def _select_parser(path: Path, hint: str | None = None) -> ParserConfig:
     if hint and (parser_type := CONFIG_MAP.get(hint)):
         return parser_type
 
     for match, value in MATCH_MAP.items():
-        if fnmatch(entry.path, f"{match}"):
+        if path.match(match):
             return value
 
-    extension = entry.path.rsplit(".", 1)[-1]
-
-    extention_parser = CONFIG_MAP.get(extension, ParserConfig(Default))
-    return KNOWN_FILES.get(entry.name, extention_parser)
+    extention_parser = CONFIG_MAP.get(path.suffix.lstrip("."), ParserConfig(Default))
+    return KNOWN_FILES.get(path.name, extention_parser)

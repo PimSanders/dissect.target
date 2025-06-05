@@ -3,17 +3,22 @@ from __future__ import annotations
 import datetime
 import re
 from functools import lru_cache
-from pathlib import Path
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any
 
 from dissect.eventlog import evtx
 from dissect.eventlog.exceptions import MalformedElfChnkException
 from flow.record import Record, utils
 
-from dissect.target import plugin
 from dissect.target.exceptions import FilesystemError
 from dissect.target.helpers.record import DynamicDescriptor, TargetRecordDescriptor
+from dissect.target.plugin import Plugin, arg, export
 from dissect.target.plugins.os.windows.log.evt import WindowsEventlogsMixin
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from pathlib import Path
+
+    from dissect.target.target import Target
 
 re_illegal_characters = re.compile(r"[\(\): \.\-#\/]")
 
@@ -21,7 +26,7 @@ re_illegal_characters = re.compile(r"[\(\): \.\-#\/]")
 EVTX_GLOB = "*.evtx"
 
 
-class EvtxPlugin(WindowsEventlogsMixin, plugin.Plugin):
+class EvtxPlugin(WindowsEventlogsMixin, Plugin):
     """Plugin for fetching and parsing Windows Eventlog Files (``*.evtx``)."""
 
     RECORD_NAME = "filesystem/windows/evtx"
@@ -30,13 +35,13 @@ class EvtxPlugin(WindowsEventlogsMixin, plugin.Plugin):
     NEEDLE = b"ElfChnk\x00"
     CHUNK_SIZE = 0x10000
 
-    def __init__(self, target):
+    def __init__(self, target: Target):
         super().__init__(target)
         self._create_event_descriptor = lru_cache(4096)(self._create_event_descriptor)
 
-    @plugin.arg("--logs-dir", help="logs directory to scan")
-    @plugin.arg("--log-file-glob", default=EVTX_GLOB, help="glob pattern to match a log file name")
-    @plugin.export(record=DynamicDescriptor(["datetime"]))
+    @arg("--logs-dir", help="logs directory to scan")
+    @arg("--log-file-glob", default=EVTX_GLOB, help="glob pattern to match a log file name")
+    @export(record=DynamicDescriptor(["datetime"]))
     def evtx(self, log_file_glob: str = EVTX_GLOB, logs_dir: str | None = None) -> Iterator[DynamicDescriptor]:
         """Return entries from Windows Event log files (``*.evtx``).
 
@@ -81,16 +86,16 @@ class EvtxPlugin(WindowsEventlogsMixin, plugin.Plugin):
             for event in evtx.Evtx(entry_data):
                 yield self._build_record(event, entry)
 
-    @plugin.export(record=DynamicDescriptor(["datetime"]))
+    @export(record=DynamicDescriptor(["datetime"]))
     def scraped_evtx(self) -> Iterator[DynamicDescriptor]:
-        """Return EVTX log file records scraped from target disks"""
+        """Return EVTX log file records scraped from target disks."""
         yield from self.target.scrape.scrape_chunks_from_disks(
             needle=self.NEEDLE,
             chunk_size=self.CHUNK_SIZE,
             chunk_parser=self._parse_chunk,
         )
 
-    def _parse_chunk(self, _, chunk: bytes) -> Iterator[Record]:
+    def _parse_chunk(self, needle: bytes, chunk: bytes) -> Iterator[Record]:
         chnk = evtx.ElfChnk(chunk)
         try:
             for event in chnk.read():
@@ -120,7 +125,7 @@ class EvtxPlugin(WindowsEventlogsMixin, plugin.Plugin):
 
             if not key.isprintable():
                 self.target.log.warning(
-                    f"Skipped possibly corrupt field record containing non-printable characters: {key}"
+                    "Skipped possibly corrupt field record containing non-printable characters: %s", key
                 )
                 continue
 
@@ -162,13 +167,13 @@ class EvtxPlugin(WindowsEventlogsMixin, plugin.Plugin):
         desc = self._create_event_descriptor(tuple(record_fields))
         return desc(**record_values)
 
-    def _create_event_descriptor(self, record_fields) -> TargetRecordDescriptor:
+    def _create_event_descriptor(self, record_fields: list[tuple[str, str]]) -> TargetRecordDescriptor:
         return TargetRecordDescriptor(self.RECORD_NAME, record_fields)
 
 
 def format_value(value: Any) -> Any:
     if value is None or value == "-":
-        return
+        return None
 
     if isinstance(value, evtx.BxmlSub):
         value = value.get()
@@ -195,5 +200,4 @@ def unique_key(key: str, dictionary: dict[str, Any], count: int | None = None) -
     if new_key in dictionary:
         return unique_key(key, dictionary, count + 1)
 
-    else:
-        return new_key
+    return new_key

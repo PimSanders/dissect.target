@@ -1,4 +1,6 @@
-from typing import Iterator
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 from dissect.cstruct import cstruct
 
@@ -7,6 +9,9 @@ from dissect.target.plugin import export
 from dissect.target.plugins.os.windows.dpapi.keyprovider.keyprovider import (
     KeyProviderPlugin,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 defaultpassword_def = """
 struct DefaultPassword {
@@ -38,13 +43,14 @@ class LSADefaultPasswordKeyProviderPlugin(KeyProviderPlugin):
 
         Resources:
             - https://learn.microsoft.com/en-us/troubleshoot/windows-server/user-profiles-and-logon/turn-on-automatic-logon
-        """  # noqa: E501
+        """
 
         for secret in ["DefaultPassword", "DefaultPassword_OldVal"]:
             if default_pass := self.target.lsa._secrets.get(secret):
                 try:
                     value = c_defaultpassword.DefaultPassword(default_pass).data
-                except Exception:
-                    self.target.log.warning("Failed to parse LSA %s value", secret)
+                except Exception as e:
+                    self.target.log.warning("Failed to parse LSA %s value (%r): %s", secret, default_pass, e)
+                    self.target.log.debug("", exc_info=e)
                     continue
                 yield self.__namespace__, value
