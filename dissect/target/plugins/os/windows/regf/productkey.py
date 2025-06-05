@@ -43,5 +43,6 @@ class ProductKeyPlugin(Plugin):
                 backup_product_key_default=values.get("BackupProductKeyDefault"),
                 cache_store=values.get("CacheStore"),
                 token_store=values.get("TokenStore"),
+                type=values.get("Type"),
                 _target=self.target,
             )
