@@ -33,7 +33,10 @@ SearchIndexFileInfoRecord = TargetRecordDescriptor(
         ("string", "owner"),
         ("string", "systemitemtype"),
         ("string", "fileattributes"),
-        ("string", "autosummary"), # Apparently this field obfuscated and compressed in XP, Vista and 7 (https://github.com/libyal/documentation/blob/8f22687893b85299e340f82cae54b482354a4f1d/Forensic%20analysis%20of%20the%20Windows%20Search%20database.pdf)
+        (
+            "string",
+            "autosummary",
+        ),  # Apparently this field obfuscated and compressed in XP, Vista and 7 (https://github.com/libyal/documentation/blob/8f22687893b85299e340f82cae54b482354a4f1d/Forensic%20analysis%20of%20the%20Windows%20Search%20database.pdf)
         ("path", "source"),
         ("string", "latest"),
         ("varint", "checkpointindex"),
@@ -63,7 +66,7 @@ FILES = [
     "Applications/Windows/Windows.db",  # Windows 11 (ish? Doesn't seem to be consistent in all Windows 11 implementations)
 ]
 
-EVENTLOG_REGISTRY_KEY = "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Search"
+EVENTLOG_REGISTRY_KEY = "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows Search"
 
 WIN_DATETIME_FIELDS = [
     "LastModified",
@@ -95,16 +98,20 @@ PROPSTORE_INCLUDE_COLUMNS = [
     "System_Author",
 ]
 
+
 class EseDBTableRecords:
     def __init__(self, fh: BinaryIO):
         self.esedb = EseDB(fh)
-    
+
     def get_table_records(self, table_name: str, include_columns: list[str]) -> Iterator[RecordValue]:
         table = self.esedb.table(table_name)
-        table_columns = [column.name for column in table.columns if any(include in column.name for include in include_columns)]
+        table_columns = [
+            column.name for column in table.columns if any(include in column.name for include in include_columns)
+        ]
 
         for record in table.records():
             yield {col.split("-")[-1]: record.get(col) for col in table_columns}
+
 
 class SearchIndexPlugin(Plugin):
     """Plugin that extracts records from the Windows Search Index database files.
@@ -145,7 +152,7 @@ class SearchIndexPlugin(Plugin):
             path (Path): Path to the EDB file
         """
 
-        # Open the EDB file with the SearchIndex class from dissect.esedb
+        # Open the EDB file
         si = EseDBTableRecords(path.open("rb"))
 
         # Get all interesting columns from the Gthr table
@@ -307,8 +314,8 @@ class SearchIndexPlugin(Plugin):
                         # If the column is not a datetime field, just use the value
                         value = row[2]
                     if row[0] not in propstore_records.keys():
-                        # If the workid is not in the propstore_records dict, add it.
-                        # This happens if the WAL contains new workids(/files) which aren't present in the base SQLite file.
+                        # If the workid is not in the propstore_records dict, add it
+                        # This happens if the WAL contains new workids(/files) which aren't present in the base SQLite file
                         propstore_records[row[0]] = [
                             {
                                 column_name: value,
@@ -379,9 +386,11 @@ class SearchIndexPlugin(Plugin):
                         filename=filename,
                         gathertime=record.get("System_Search_GatherTime"),
                         SDID=record.get("SDID"),
-                        size=int.from_bytes(record.get("System_Size"), "little")
-                        if record.get("System_Size") is not None
-                        else None,
+                        size=(
+                            int.from_bytes(record.get("System_Size"), "little")
+                            if record.get("System_Size") is not None
+                            else None
+                        ),
                         date_modified=record.get("System_DateModified"),
                         date_created=record.get("System_DateCreated"),
                         date_accessed=record.get("System_DateAccessed"),
