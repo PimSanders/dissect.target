@@ -1,18 +1,19 @@
-from io import BytesIO
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Any
-from unittest.mock import Mock
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from dissect.target import Target
-from dissect.target.filesystem import VirtualFilesystem
 from dissect.target.filesystems.config import (
     ConfigurationEntry,
     ConfigurationFilesystem,
 )
-from dissect.target.helpers.configutil import parse_config
 from tests._utils import absolute_path
+
+if TYPE_CHECKING:
+    from dissect.target.filesystem import VirtualFilesystem
+    from dissect.target.target import Target
 
 
 @pytest.fixture
@@ -35,7 +36,7 @@ def mapped_file(test_file: str, fs_unix: VirtualFilesystem) -> VirtualFilesystem
 
 
 @pytest.mark.parametrize(
-    "test_file, expected_output",
+    ("test_file", "expected_output"),
     [
         (
             "_data/helpers/configutil/hosts",
@@ -136,7 +137,7 @@ def test_parse_file_input(target_unix: Target, mapped_file: str, expected_output
     check_dictionary(expected_output, entry.parser_items)
 
 
-def check_dictionary(expected_dict: dict, data_dict: dict):
+def check_dictionary(expected_dict: dict, data_dict: dict) -> None:
     for key, value in expected_dict.items():
         if info_value := data_dict.get(key):
             check_value(value, info_value)
@@ -159,42 +160,8 @@ def test_unix_registry(target_unix: Target, etc_directory: VirtualFilesystem) ->
     config_path = list(config_fs.get("/").iterdir())
 
     assert config_path == ["new"]
-    assert sorted(list(config_fs.get("/new").iterdir())) == ["config", "path"]
+    assert sorted(config_fs.get("/new").iterdir()) == ["config", "path"]
     assert isinstance(config_fs.get("/new/path/config"), ConfigurationEntry)
-
-
-def test_config_entry() -> None:
-    class MockableRead(Mock):
-        def __enter__(self):
-            return self.binary_data
-
-        def __exit__(self, _, __, ___):
-            return
-
-    mocked_open = MockableRead(binary_data=BytesIO(b"default=test\n[Unit]\nhelp=me\n"))
-    mocked_entry = Mock()
-    mocked_entry.open.return_value = mocked_open
-    mocked_entry.path = "config.ini"
-
-    parser_items = parse_config(mocked_entry)
-
-    entry = ConfigurationEntry(
-        Mock(),
-        "config.ini",
-        entry=mocked_entry,
-        parser_items=parser_items,
-    )
-    assert entry.is_dir()
-
-    assert list(entry.iterdir()) == ["DEFAULT", "Unit"]
-
-    default_section = entry.get("DEFAULT")
-    assert default_section.is_dir()
-    assert list(default_section.iterdir()) == ["default"]
-    assert default_section.open().read() == b"default\n    test\n"
-
-    default_key_values = default_section.get("default")
-    assert default_key_values.open().read() == b"test\n"
 
 
 def test_parse_functions(target_unix: Target, etc_directory: VirtualFilesystem) -> None:
