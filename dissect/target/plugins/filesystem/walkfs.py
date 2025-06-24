@@ -45,9 +45,10 @@ class WalkFSPlugin(Plugin):
     @export(record=FilesystemRecord)
     @arg("--walkfs-path", default="/", help="path to recursively walk")
     @arg("--calculate-entropy", action="store_true", help="calculate entropy for each file")
-    def walkfs(self, walkfs_path: str = "/", calculate_entropy: bool = False) -> Iterator[FilesystemRecord]:
+    @arg("--max-depth", type=int, default=0, help="maximum depth to walk (0 for unlimited)")
+    def walkfs(self, walkfs_path: str = "/", calculate_entropy: bool = False, max_depth: int = 0) -> Iterator[FilesystemRecord]:
         """Walk a target's filesystem and return all filesystem entries."""
-
+ 
         path = self.target.fs.path(walkfs_path)
 
         if not path.exists():
@@ -59,21 +60,22 @@ class WalkFSPlugin(Plugin):
             return
 
         for entry in self.target.fs.recurse(walkfs_path):
-            try:
-                entropy = 0
+            if max_depth == 0 or entry.depth() <= max_depth:
+                try:
+                    entropy = 0
 
-                if not entry.is_dir() and calculate_entropy:
-                    entropy = _calculate_entropy(entry)
+                    if not entry.is_dir() and calculate_entropy:
+                        entropy = _calculate_entropy(entry)
 
-                yield generate_record(self.target, entry, entropy)
+                    yield generate_record(self.target, entry, entropy)
 
-            except FileNotFoundError as e:  # noqa: PERF203
-                self.target.log.warning("File not found: %s", entry)
-                self.target.log.debug("", exc_info=e)
-            except Exception as e:
-                self.target.log.warning("Exception generating record for: %s, %s", entry, e)
-                self.target.log.debug("", exc_info=e)
-                continue
+                except FileNotFoundError as e:  # noqa: PERF203
+                    self.target.log.warning("File not found: %s", entry)
+                    self.target.log.debug("", exc_info=e)
+                except Exception as e:
+                    self.target.log.warning("Exception generating record for: %s, %s", entry, e)
+                    self.target.log.debug("", exc_info=e)
+                    continue
 
 
 def _calculate_entropy(path: str) -> float:

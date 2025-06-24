@@ -839,6 +839,16 @@ class FilesystemEntry:
         if algos:
             return hashutil.custom(self.open(), algos)
         return hashutil.common(self.open())
+    
+    def depth(self) -> int:
+        """Calculate the depth of this entry in the filesystem.
+
+        The depth is defined as the number of directories from the root to this entry.
+
+        Returns:
+            The depth of this entry in the filesystem.
+        """
+        return len(self.path.split("/")) - 1 if "/" else self.path.count(os.sep)
 
 
 class VirtualDirectory(FilesystemEntry):
@@ -1684,6 +1694,10 @@ class RootFilesystemEntry(LayerFilesystemEntry):
     def lattr(self) -> Any:
         self.fs.target.log.debug("%r::lattr()", self)
         return super().lattr()
+    
+    def depth(self) -> int:
+        self.fs.target.log.debug("%r::depth()", self)
+        return super().depth()
 
 
 def register(module: str, class_name: str, internal: bool = True) -> None:
