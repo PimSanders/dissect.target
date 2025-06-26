@@ -36,7 +36,7 @@ SearchIndexFileInfoRecord = TargetRecordDescriptor(
         (
             "string",
             "autosummary",
-        ),  # Apparently this field obfuscated and compressed in XP, Vista and 7 (https://github.com/libyal/documentation/blob/8f22687893b85299e340f82cae54b482354a4f1d/Forensic%20analysis%20of%20the%20Windows%20Search%20database.pdf)
+        ),  # Apparently this field is obfuscated and compressed in XP, Vista and 7 (https://github.com/libyal/documentation/blob/8f22687893b85299e340f82cae54b482354a4f1d/Forensic%20analysis%20of%20the%20Windows%20Search%20database.pdf)
         ("path", "source"),
         ("string", "latest"),
         ("varint", "checkpointindex"),
@@ -61,7 +61,11 @@ SearchIndexFileActivityRecord = TargetRecordDescriptor(
 )
 
 # TODO: Add support for individual user indexes on Windows Server (https://github.com/fox-it/acquire/pull/200)
-FILES = [
+USER_FILES = [
+    "AppData/Roaming/Microsoft/Search/Data/Applications/S-1-*/*"
+]
+
+SYSTEM_FILES = [
     "Applications/Windows/Windows.edb",  # Windows 10 and earlier
     "Applications/Windows/Windows.db",  # Windows 11 (ish? Doesn't seem to be consistent in all Windows 11 implementations)
 ]
@@ -134,7 +138,15 @@ class SearchIndexPlugin(Plugin):
             self.target.log.error("Cannot access registry in target")
             return
         # Check if the database files exist and add them to the _files list
-        for filename in FILES:
+        # for user_details in self.target.user_details.all_with_home():
+        #     for directory in USER_FILES:
+        #         databasepath = self.target.resolve(
+        #             f"{user_details.home}/{directory.replace('*', user_details.sid)}"
+        #         )
+        #         if target.fs.path(databasepath).exists():
+        #             self._files.append(target.fs.path(databasepath))
+
+        for filename in SYSTEM_FILES:
             databasepath = self.target.resolve(datadir + filename)
             if target.fs.path(databasepath).exists():
                 self._files.append(target.fs.path(databasepath))
@@ -407,7 +419,7 @@ class SearchIndexPlugin(Plugin):
                         _target=self.target,
                     )
 
-
+#TODO: check if this is needed
 def get_workid_from_checkpoint(checkpoint: WALCheckpoint) -> list[str]:
     """Get all workids from a checkpoint.
 
