@@ -1,23 +1,25 @@
 from __future__ import annotations
 
-from typing import BinaryIO, Iterator
+from typing import TYPE_CHECKING, BinaryIO
 
-from dissect.esedb.c_esedb import RecordValue
 from dissect.esedb.esedb import EseDB
-
 from dissect.ntfs.c_ntfs import c_ntfs
-
 from dissect.sql import sqlite3
-from dissect.sql.exceptions import NoCellData, InvalidPageType
-from dissect.sql.sqlite3 import WALCheckpoint
+from dissect.sql.exceptions import InvalidPageType, NoCellData
+from dissect.util.ts import wintimestamp
 
-from dissect.target import Target
 from dissect.target.exceptions import PluginError, RegistryKeyNotFoundError, UnsupportedPluginError
-from dissect.target.helpers.fsutil import TargetPath
 from dissect.target.helpers.record import TargetRecordDescriptor
 from dissect.target.plugin import Plugin, export
 
-from dissect.util.ts import wintimestamp
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from dissect.esedb.c_esedb import RecordValue
+    from dissect.sql.sqlite3 import WALCheckpoint
+
+    from dissect.target import Target
+    from dissect.target.helpers.fsutil import TargetPath
 
 SearchIndexFileInfoRecord = TargetRecordDescriptor(
     "filesystem/windows/searchindex/fileinformation",
@@ -61,13 +63,13 @@ SearchIndexFileActivityRecord = TargetRecordDescriptor(
 )
 
 # TODO: Add support for individual user indexes on Windows Server (https://github.com/fox-it/acquire/pull/200)
-USER_FILES = [
-    "AppData/Roaming/Microsoft/Search/Data/Applications/S-1-*/*"
-]
+USER_FILES = ["AppData/Roaming/Microsoft/Search/Data/Applications/S-1-*/*"]
 
 SYSTEM_FILES = [
-    "Applications/Windows/Windows.edb",  # Windows 10 and earlier
-    "Applications/Windows/Windows.db",  # Windows 11 (ish? Doesn't seem to be consistent in all Windows 11 implementations)
+    # Windows 10 and earlier
+    "Applications/Windows/Windows.edb",
+    # Windows 11 (ish? Doesn't seem to be consistent in all Windows 11 implementations)
+    "Applications/Windows/Windows.db",
 ]
 
 EVENTLOG_REGISTRY_KEY = "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows Search"
@@ -132,10 +134,10 @@ class SearchIndexPlugin(Plugin):
         try:
             datadir = self.target.registry.key(EVENTLOG_REGISTRY_KEY).value("DataDirectory").value
         except RegistryKeyNotFoundError:
-            self.target.log.error('No Windows Search registry key "%s" found', EVENTLOG_REGISTRY_KEY)
+            self.target.log.exception('No Windows Search registry key "%s" found', EVENTLOG_REGISTRY_KEY)
             return
         except PluginError:
-            self.target.log.error("Cannot access registry in target")
+            self.target.log.exceptionjj("Cannot access registry in target")
             return
         # Check if the database files exist and add them to the _files list
         # for user_details in self.target.user_details.all_with_home():
@@ -158,7 +160,8 @@ class SearchIndexPlugin(Plugin):
     def _get_edb_records(self, path: TargetPath) -> list[dict]:
         """Get records from an EDB file.
 
-        Gathers all interesting fields from the SystemIndex_Gthr and SystemIndex_PropertyStore tables and combines them into one dict.
+        Gathers all interesting fields from the SystemIndex_Gthr and SystemIndex_PropertyStore tables
+        and combines them into one dict.
 
         Args:
             path (Path): Path to the EDB file
@@ -169,7 +172,10 @@ class SearchIndexPlugin(Plugin):
 
         # Get all interesting columns from the Gthr table
         gthr_table_rows = list(
-            # Possible include_columns are: ScopeID, DocumentID, SDID, LastModified, TransactionFlags, TransactionExtendedFlags, CrawlNumberCrawled, StartAddressIdentifier, Priority, FileName, UserData, AppOwnerId, RequiredSIDs, DeletedCount, RunTime, FailureUpdateAttempts, ClientID, LastRequestedRunTime, StorageProviderId, CalculatedPropertyFlags
+            # Possible include_columns are: ScopeID, DocumentID, SDID, LastModified, TransactionFlags,
+            # TransactionExtendedFlags, CrawlNumberCrawled, StartAddressIdentifier, Priority, FileName,
+            # UserData, AppOwnerId, RequiredSIDs, DeletedCount, RunTime, FailureUpdateAttempts, ClientID,
+            # LastRequestedRunTime, StorageProviderId, CalculatedPropertyFlags
             si.get_table_records("SystemIndex_Gthr", include_columns=["DocumentID", "FileName", "LastModified", "SDID"])
         )
         # Create a dict with DocumentID as key
@@ -199,7 +205,8 @@ class SearchIndexPlugin(Plugin):
         # Create a dict with WorkID as key
         propstore_rows = {row["WorkID"]: row for row in propstore_table_rows}
 
-        # Create a dict with DocumentID as key and a dict with the column found, convert the LastModified field to a datetime object
+        # Create a dict with DocumentID as key and a dict with the column found, convert the LastModified
+        # field to a datetime object
         propstore_records = {}
         for work_id, row in propstore_rows.items():
             for column_name in row:
@@ -213,7 +220,7 @@ class SearchIndexPlugin(Plugin):
                             value = None
                 else:
                     value = row[column_name]
-                if work_id not in propstore_records.keys():
+                if work_id not in propstore_records:
                     propstore_records[work_id] = [{column_name: value}]
                 else:
                     propstore_records[work_id][0][column_name] = value
@@ -229,8 +236,7 @@ class SearchIndexPlugin(Plugin):
                 row = row | gthr_records[iterator]
             # If the ID is in the propstore_rows dict, add it to the row
             if iterator in propstore_records:
-                for record in propstore_records[iterator]:
-                    rows.append(row | record | {"latest": False})
+                rows.extend([row | record | {"latest": False} for record in propstore_records[iterator]])
                 rows[-1]["latest"] = True
             # If the row has more than one key, add it to the rows list
             elif len(row) > 1:
@@ -265,7 +271,7 @@ class SearchIndexPlugin(Plugin):
         if (gather_db_wal := self.target.fs.path(str(gather_file) + "-wal")).exists():
             gather_db.open_wal(gather_db_wal.open())
 
-        gthr_table_rows = sorted(list(gather_db.table("SystemIndex_Gthr")), key=lambda x: x["DocumentID"])
+        gthr_table_rows = sorted(gather_db.table("SystemIndex_Gthr"), key=lambda x: x["DocumentID"])
 
         # Define gthr_records as a dict with DocumentID as key and a dict with FileName, LastModified and SDID as value
         gthr_records = {}
@@ -287,7 +293,7 @@ class SearchIndexPlugin(Plugin):
             if column_name in PROPSTORE_INCLUDE_COLUMNS:
                 propstore_metadata[row["Id"]] = column_name
 
-        propstore_table_rows = sorted(list(db.table("SystemIndex_1_PropertyStore")), key=lambda x: x["WorkId"])
+        propstore_table_rows = sorted(db.table("SystemIndex_1_PropertyStore"), key=lambda x: x["WorkId"])
 
         propstore_records = {}
         for row in propstore_table_rows:
@@ -302,7 +308,7 @@ class SearchIndexPlugin(Plugin):
                         value = None
             else:
                 value = row["Value"]
-            if work_id not in propstore_records.keys():
+            if work_id not in propstore_records:
                 propstore_records[work_id] = [{column_name: value, "checkpointindex": 0}]
             else:
                 propstore_records[work_id][0][column_name] = value
@@ -325,9 +331,9 @@ class SearchIndexPlugin(Plugin):
                     else:
                         # If the column is not a datetime field, just use the value
                         value = row[2]
-                    if row[0] not in propstore_records.keys():
-                        # If the workid is not in the propstore_records dict, add it
-                        # This happens if the WAL contains new workids(/files) which aren't present in the base SQLite file
+                    if row[0] not in propstore_records:
+                        # If the workid is not in the propstore_records dict, add it. This happens if the WAL
+                        # contains new workids(/files) which aren't present in the base SQLite file
                         propstore_records[row[0]] = [
                             {
                                 column_name: value,
@@ -355,8 +361,7 @@ class SearchIndexPlugin(Plugin):
                 row = row | gthr_records[iterator]
             # If the ID is in the propstore_rows dict, add it to the row
             if iterator in propstore_records:
-                for record in propstore_records[iterator]:
-                    rows.append(row | record | {"latest": False})
+                rows.extend([row | record | {"latest": False} for record in propstore_records[iterator]])
                 rows[-1]["latest"] = True
             # If the row has more than one key, add it to the rows list
             elif len(row) > 1:
@@ -365,7 +370,7 @@ class SearchIndexPlugin(Plugin):
         return rows
 
     @export(record=SearchIndexFileInfoRecord)
-    def searchindex(self):
+    def searchindex(self) -> Iterator[SearchIndexFileInfoRecord]:
         """Yield records from the SearchIndex database files."""
         for path in self._files:
             if path.name.endswith(".edb"):
@@ -419,25 +424,6 @@ class SearchIndexPlugin(Plugin):
                         _target=self.target,
                     )
 
-#TODO: check if this is needed
-def get_workid_from_checkpoint(checkpoint: WALCheckpoint) -> list[str]:
-    """Get all workids from a checkpoint.
-
-    Args:
-        checkpoint (Checkpoint): The checkpoint to get the workids from.
-    """
-    workids = set()
-    for frame in checkpoint.frames:
-        try:
-            for cell in frame.page.cells():
-                try:
-                    workids.add(cell.values[0])
-                except NoCellData:
-                    pass
-        except InvalidPageType:
-            pass
-    return list(workids)
-
 
 def get_changes_between_db_and_checkpoint(db: sqlite3, checkpoint: WALCheckpoint) -> list:
     """Get all changes between the database and a checkpoint.
@@ -466,8 +452,6 @@ def get_changes_between_db_and_checkpoint(db: sqlite3, checkpoint: WALCheckpoint
         except (NoCellData, AttributeError):
             checkpoint_cell_values = []
 
-        for value in checkpoint_cell_values:
-            if value not in db_cell_values:
-                different_values.append(value)
+        different_values.extend([value for value in checkpoint_cell_values if value not in db_cell_values])
 
     return different_values
