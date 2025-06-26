@@ -323,10 +323,13 @@ class SearchIndexPlugin(Plugin):
                             }
                         ]
                     else:
+                        # If the current checkpoint index is higher than the last stored one for this workid,
+                        # create a new dict for this checkpoint based on the previous one
                         if propstore_records[row[0]][-1]["checkpointindex"] < checkpoint.index:
                             new_dict = propstore_records[row[0]][-1].copy()
                             new_dict["checkpointindex"] = checkpoint.index
                             propstore_records[row[0]].append(new_dict)
+                        # Update the value for the current column in the latest checkpoint dict
                         propstore_records[row[0]][-1][column_name] = value
 
         rows = []
