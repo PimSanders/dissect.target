@@ -137,7 +137,7 @@ class SearchIndexPlugin(Plugin):
             self.target.log.exception('No Windows Search registry key "%s" found', EVENTLOG_REGISTRY_KEY)
             return
         except PluginError:
-            self.target.log.exceptionjj("Cannot access registry in target")
+            self.target.log.exception("Cannot access registry in target")
             return
         # Check if the database files exist and add them to the _files list
         # for user_details in self.target.user_details.all_with_home():
