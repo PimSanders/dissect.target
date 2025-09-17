@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import urllib.parse
 from typing import TYPE_CHECKING, Any, Union
 
 from dissect.esedb import EseDB
@@ -235,7 +236,7 @@ class SearchIndexPlugin(Plugin):
                 browser=browser,
                 url=values.get("System_Link_TargetUrl") or url,
                 title=values.get("System_Title"),
-                host=None,  # TODO: derive from url
+                host=urllib.parse.urlparse(values.get("System_Link_TargetUrl")).hostname or None,
                 source=db_path,
                 _user=user,
                 _target=self.target,
