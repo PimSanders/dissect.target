@@ -53,6 +53,8 @@ SearchIndexActivityRecord = TargetRecordDescriptor(
     ],
 )
 
+SEARCH_INDEX_REGISTRY_KEY = "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows Search"
+
 RE_URL = re.compile(r"(?P<browser>.+)\:\/\/\{(?P<sid>.+)\}\/(?P<url>.+)$")
 
 BROWSER_RECORD_MAP = {
@@ -66,14 +68,14 @@ SearchIndexRecords = Union[SearchIndexRecord, SearchIndexActivityRecord, Browser
 class SearchIndexPlugin(Plugin):
     """Windows Search Index plugin."""
 
-    SYSTEM_PATHS = (
+    SYSTEM_PATHS = [
         # Windows 11 22H2 (SQLite3)
         "sysvol/ProgramData/Microsoft/Search/Data/Applications/Windows/Windows.db",
         # Windows Vista and Windows 10 (EseDB)
         "sysvol/ProgramData/Microsoft/Search/Data/Applications/Windows/Windows.edb",
         # Windows XP (EseDB)
         "sysvol/Documents and Settings/All Users/Application Data/Microsoft/Search/Data/Applications/Windows/Windows.edb",  # noqa: E501
-    )
+    ]
 
     USER_PATHS = (
         # Windows 10 Server Roaming (EseDB / SQLite)
@@ -86,6 +88,12 @@ class SearchIndexPlugin(Plugin):
 
     def find_databases(self) -> Iterator[tuple[Path, UserDetails | None]]:
         seen = set()
+
+        # Find possible custom location of Windows Search Index databases.
+        data_dir = self.target.registry.key(SEARCH_INDEX_REGISTRY_KEY).value("DataDirectory").value
+        for filename in ["Windows.edb", "Windows.db"]:
+            path = self.target.resolve(f"{data_dir}/Applications/Windows/{filename}")
+            self.SYSTEM_PATHS.append(path)
 
         for system_path in self.SYSTEM_PATHS:
             if (path := self.target.fs.path(system_path)).is_file():
