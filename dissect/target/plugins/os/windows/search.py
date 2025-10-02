@@ -5,7 +5,8 @@ import urllib.parse
 from typing import TYPE_CHECKING, Any, Union, get_args
 
 from dissect.esedb import EseDB
-from dissect.sql import SQLite3
+from dissect.sql import sqlite3, SQLite3
+from dissect.sql.exceptions import InvalidPageType, NoCellData
 from dissect.util.ts import wintimestamp
 
 from dissect.target.exceptions import UnsupportedPluginError
@@ -22,6 +23,8 @@ if TYPE_CHECKING:
     from dissect.esedb.record import Record as EseDBRecord
     from dissect.esedb.table import Table as EseDBTable
 
+    from dissect.sql.sqlite3 import WALCheckpoint
+
     from dissect.target.plugins.general.users import UserDetails
     from dissect.target.target import Target
 
@@ -37,6 +40,7 @@ SearchIndexRecord = TargetRecordDescriptor(
         ("filesize", "size"),
         ("string", "data"),
         ("path", "source"),
+        ("varint", "checkpoint"),
     ],
 )
 
@@ -50,6 +54,7 @@ SearchIndexActivityRecord = TargetRecordDescriptor(
         ("string", "application_id"),
         ("string", "activity_id"),
         ("path", "source"),
+        ("varint", "checkpoint"),
     ],
 )
 
@@ -161,39 +166,57 @@ class SearchIndexPlugin(Plugin):
             for record in table.records():
                 yield from self.build_record(TableRecord(table, record), user_details, path)
 
-    def parse_sqlite(self, path: Path, user_details: UserDetails | None) -> Iterator[SearchIndexRecords]:
-        """Parse the SQLite3 ``SystemIndex_1_PropertyStore`` table."""
+    def parse_sqlite(self, path: Path, user_details: 'UserDetails | None'):
+        """Parse the SQLite3 ``SystemIndex_1_PropertyStore`` table, including WAL checkpoints."""
 
         with path.open("rb") as fh:
             db = SQLite3(fh)
 
-            # ``ColumnId`` is translated using the ``SystemIndex_1_PropertyStore_Metadata`` table.
+            # Try to open the WAL file if it exists
+            wal_path = self.target.fs.path(str(path) + "-wal")
+            db_wal = None
+            if wal_path.exists():
+                db_wal = SQLite3(path.open("rb"))
+                db_wal.open_wal(wal_path.open())
+
+            # Read metadata table
             columns = {
                 row.get("Id"): row.get("UniqueKey", "").split("-", maxsplit=1)[-1]
                 for row in db.table("SystemIndex_1_PropertyStore_Metadata").rows()
             }
 
+            # Read property store table
             if not (table := db.table("SystemIndex_1_PropertyStore")):
                 self.target.log.warning("Database %s does not have a table called 'SystemIndex_1_PropertyStore'", path)
                 return
 
-            current_work_id = None
-            values = {}
-
+            propstore_records = {}
             for row in table.rows():
                 work_id = row.get("WorkId")
-                if current_work_id is None:
-                    current_work_id = work_id
-                if work_id != current_work_id:
-                    yield from self.build_record(values, user_details, path)
-                    current_work_id = work_id
-                    values = {}
+                column_id = row.get("ColumnId")
+                column_name = columns.get(column_id, str(column_id))
+                value = row.get("Value")
+                if work_id not in propstore_records:
+                    propstore_records[work_id] = {column_name: value, "checkpoint": 0}
+                else:
+                    propstore_records[work_id][column_name] = value
 
-                if value := row.get("Value"):
-                    column_name = columns[row.get("ColumnId")]
-                    values[column_name] = value
+            # Merge WAL changes if present
+            if db_wal:
+                for checkpoint in db_wal.wal.checkpoints:
+                    diff = get_changes_between_db_and_checkpoint(db, checkpoint)
+                    for row in diff:  # row = [workid, columnid, value]
+                        work_id, column_id, value = row[0], row[1], row[2] if len(row) > 2 else None
+                        column_name = columns.get(column_id, str(column_id))
+                        if work_id not in propstore_records:
+                            propstore_records[work_id] = {column_name: value, "checkpoint": checkpoint.index}
+                        else:
+                            propstore_records[work_id][column_name] = value
+                            propstore_records[work_id]["checkpoint"] = checkpoint.index
 
-            yield from self.build_record(values, user_details, path)
+            # Yield records
+            for values in propstore_records.values():
+                yield from self.build_record(values, user_details, path)
 
     def build_record(
         self, values: dict[str, Any] | TableRecord, user_details: UserDetails | None, db_path: Path
@@ -209,6 +232,7 @@ class SearchIndexPlugin(Plugin):
                 application_id=values.get("System_ActivityHistory_AppId"),
                 activity_id=values.get("System_ActivityHistory_AppActivityId"),
                 source=db_path,
+                checkpoint=values.get("checkpoint"),
                 _target=self.target,
             )
 
@@ -261,6 +285,7 @@ class SearchIndexPlugin(Plugin):
                 size=int.from_bytes(b_size, "little") if (b_size := values.get("System_Size")) else None,
                 data=values.get("System_Search_AutoSummary"),
                 source=db_path,
+                checkpoint=values.get("checkpoint"),
                 _target=self.target,
             )
 
@@ -276,3 +301,34 @@ class TableRecord:
 
     def get(self, key: str, default: Any | None = None) -> Any:
         return self.record.get(self.columns.get(key, default))
+
+def get_changes_between_db_and_checkpoint(db: sqlite3, checkpoint: WALCheckpoint) -> list:
+    """Get all changes between the database and a checkpoint.
+
+    Args:
+        db (SQLite3): The SQLite3 database to compare the checkpoint to.
+        checkpoint (Checkpoint): The checkpoint to compare to the database.
+    """
+    different_values = []
+    for frame in checkpoint.frames:
+        try:
+            if (db_page := db.page(frame.page_number)) is None:
+                db_cell_values = []
+            else:
+                db_cell_values = [cell.values if cell.size is not None else [] for cell in db_page.cells()]
+        except InvalidPageType:
+            db_cell_values = []
+
+        try:
+            checkpoint_page = frame.page
+        except (InvalidPageType, AttributeError):
+            checkpoint_page = None
+
+        try:
+            checkpoint_cell_values = [cell.values for cell in checkpoint_page.cells()]
+        except (NoCellData, AttributeError):
+            checkpoint_cell_values = []
+
+        different_values.extend([value for value in checkpoint_cell_values if value not in db_cell_values])
+
+    return different_values
